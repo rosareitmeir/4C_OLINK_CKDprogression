@@ -1,0 +1,331 @@
+---
+title: "Survival Analysis Preparation"
+output: html_notebook
+---
+
+this scripts contains the calculation of survival time (reaching the endpoint), the calculation of the inflammation score, and plotting of Kaplan-Meier Curves for the different inflammation score groups as well as the distirbution of eGFR and UACR in those groups. 
+
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(paletteer)
+library(tibble)
+library(stringr)
+library(survival)
+library(purrr)
+library(ggpubr)
+library(survminer)
+library(broom)
+library(gridExtra)
+library(viridisLite)
+library(ggstats)
+library(matrixStats)
+library(purrr)
+library(corrplot)
+```
+
+```{r}
+source("~/Projects/4cstudy/code_upload/survival_analysis_functions.R")
+```
+
+## 1 Data
+clinical data: 
+```{r}
+pat_withoutegfr <- xxx
+
+## clinical data at study entrance (egfr, proteinuria,...)
+BL_data_bpoffice <-read.csv2("~/Projects/4cstudy/Tables/BL_data_bpoffice.csv",  sep = ",",header=T) %>% filter(patid != pat_withoutegfr) %>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))
+
+### other patient info, non related to a specific visit
+patients_file <- read_excel("~/Projects/4cstudy/ClinicalData/patients_dataset_4C_for_OLINK.xlsx")
+
+### investigation file from ckd progression, clinical data from all visits month 0 -120 
+investigation_file <-read.csv("~/Projects/4cstudy/Tables/investigation_file.csv",  sep = ",",header=T) %>% filter(!is.na(month) & month!="FALSE")%>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))  #%>% 
+### from ckd progression 
+
+# contains the first visit where the patient reached one of the endpoints: ckd50%, tx, dialysis
+reached_endpoint <- read.csv("~/Projects/4cstudy/Tables/reached_endpoint.csv", sep = ",", header=T) %>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))
+
+### olink protein values 
+olink_data <- read.csv("~/Projects/4cstudy/Tables/OLINK_data.csv",  sep = ",",header=T) %>% arrange(pat_id) %>% rename(patid=pat_id)%>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))
+olink_data <- olink_data  %>% select(patid, starts_with("rawscale")) %>% filter(patid != pat_withoutegfr) %>% mutate(across(everything(), as.numeric))
+names(olink_data) <- str_replace(names(olink_data), "rawscale_", "native_")
+
+```
+
+
+## 2 Calculate Survival Time
+
+### Death
+little modicfation for the composite endpoint: adding three patients that died from drop outs to group of reaching endpoint
+getting patients id and age at death
+```{r}
+death_patients <- setdiff(patients_file %>% filter(doreason =="Death") %>% pull(patid) ,reached_endpoint$patid )
+death_age <- patients_file %>% filter(patid %in% death_patients) %>% pull(age_in_years_at_deathdate,patid)
+
+patients_file %>% filter(patid %in% death_patients) %>% select(patid,contains("do"))
+investigation_file %>% filter(patid %in% death_patients)
+
+reached_endpoint<- reached_endpoint %>% mutate(across(c(vdate,birthdate),as.Date)) %>% mutate(across(contains("age_"),as.numeric))%>% bind_rows(investigation_file %>% mutate(across(c(vdate,birthdate),as.Date)) %>% group_by(patid) %>% filter(patid %in% death_patients & month==max(month)) %>% mutate(RRT="Death") ) 
+```
+
+### RRT
+get patients ids for the ones on RRT (Tx or Dialysis)
+```{r}
+dialysis_pats<- reached_endpoint %>% filter(RRT=="Dialysis") %>% pull(patid)
+tx_pats<- reached_endpoint %>% filter(RRT=="Tx") %>% pull(patid)
+
+egfrloss_pats_month <- reached_endpoint %>% filter(RRT=="CKD50") %>% select(patid,epm=month) #epm: endpoint month
+```
+
+### 50% eGFR loss linear interpolation
+
+for 50% egfr loss -\> linear interpolation taken all egfr values before
+and at month where 50% egfr loss is reached , based on this determine
+age where loss is reached
+
+```{r}
+age_at_50egfr_df <- investigation_file %>% filter(patid %in% egfrloss_pats_month$patid) %>% left_join(egfrloss_pats_month,by="patid") %>% group_by(patid) %>% filter(month <= epm) %>% arrange(month)  %>%
+  summarise( age_at_50egfr= approx(x=egfr,y=age_in_years_at_vdate, xout=0.5*first(egfr))$y)
+```
+
+### create survival data
+
+survival time, time frame in years between Baseline and endpoint is
+reached 1: reached, 0: censored (last available month)
+
+```{r}
+## add age at study entrance BL_age
+survival_data <- investigation_file %>% left_join(BL_data_bpoffice %>% mutate(BL_age= as.numeric(age_in_years_at_vdate) )%>% select(patid,BL_age), by="patid") 
+## add age_at_50egfr as column to data frame
+survival_data<- survival_data %>% left_join(age_at_50egfr_df,by="patid") 
+## calculate survival time as the age passed from study entrance (BL_age) to tx/rrt/death/50%loss or drop out
+survival_data <- survival_data %>% group_by(patid)%>% 
+mutate(survival_time = case_when(patid %in% dialysis_pats  ~ age_in_years_at_diadate -BL_age, 
+                              patid %in% tx_pats ~ age_in_years_at_tpldate-BL_age,
+                              as.character(patid) %in% death_patients ~ death_age[as.character(patid)] -BL_age,
+                              patid %in% age_at_50egfr_df$patid ~ as.numeric(age_at_50egfr)-BL_age,
+                              ## for drop outs , censored data, get age of last visit
+                              !(patid %in% reached_endpoint$patid) ~ age_in_years_at_vdate[month==max(month)]-BL_age )) 
+
+## in case no age is given, remove patients without survival time and take the minimum survival time for each patient
+survival_data <- survival_data %>% filter(!is.na(survival_time)) %>% slice_min(survival_time) %>% distinct(patid,survival_time) 
+### add binary reached endpoint 
+survival_data <- survival_data %>%mutate(reachep= if_else(patid %in% reached_endpoint$patid ,1,0)) 
+```
+```{r}
+## remove patients with only one entrance and being censored
+only_one_entrance_ids <- investigation_file %>% group_by(patid) %>% filter(n()==1) %>% pull(patid)
+
+survival_data <- survival_data %>% filter(!(patid %in% only_one_entrance_ids & reachep==0) )
+```
+
+add clinical at study entrance to survival data
+```{r}
+survival_clinical_data <- survival_data %>% select(patid,survival_time,reachep) %>% left_join(BL_data_bpoffice,by="patid")
+
+```
+
+## 3 Calculate Inflammation Score
+
+first step: linear model protein ~ eGFR + alburie, get residuals from this model
+protein levels not explained by eGFR or alburie 
+
+```{r}
+olink_data <- olink_data %>% filter(patid %in% survival_clinical_data$patid ) %>% arrange(patid) 
+
+residuals_proteins <- sapply(names(olink_data %>% select(starts_with("native"))), function(x){
+
+      form <- formula(paste(x, "~ egfr + log(alburie +0.01)" ))
+     model <- lm(form, data= left_join(survival_clinical_data %>% arrange(patid), olink_data %>% select(patid, {{x}}) ,by="patid" )%>% arrange(patid),
+                 na.action = "na.exclude")
+    
+     return(residuals(model))}) %>%
+    ## add patient ids , for all with eGFR and alburie information
+    as.data.frame() %>% mutate(patid =olink_data$patid) %>% relocate(patid) %>% filter(!is.na(native_il8))
+
+## change protein names
+names(residuals_proteins) <- str_replace(names(residuals_proteins),"native_", "residual_")
+```
+
+second step: labels residuals as "unsual" high (not explained by ckd status) if residuals is above the xxth percentile (50th-90th)
+```{r}
+## label residuals as high or not high for each cut off
+ for (cutoff in seq(0.5, 0.9, 0.1)) {
+  residuals_proteins <- residuals_proteins %>% mutate(across(
+    starts_with("residual_"),
+    ~ ifelse(. >= quantile(., cutoff, na.rm = TRUE), 1, 0),
+    .names = paste0("high_", cutoff*100, "_{.col}")
+  ))
+ }
+```
+
+third step: 
+i-score for the five proteins in protein_set
+sum up all resifuals above threshold = i-score
+i_score= for the 80th cutoff 
+but also for the other cutoffs
+
+```{r}
+protein_set <- c("tnfrsf9","pd_l1","cx3cl1","cd40")
+setnames<- c("CD137","PD_L1","CX3CL1","CD40")
+```
+
+```{r}
+residuals_proteins<- residuals_proteins %>% group_by(patid) %>% mutate(i_score= as.character(sum(c_across(paste0("high_80_residual_",protein_set)), na.rm = TRUE))) %>% ungroup()
+
+iscores <- reduce(seq(0.5, 0.9, 0.1), function(df, cutoff) {
+  cutoff_perc=cutoff*100
+  colnames <- paste0(paste0("high_", cutoff_perc, "_residual_"),protein_set)
+  score_col <- paste0("i_score_", cutoff_perc)
+  
+  df %>%
+    group_by(patid) %>%
+    mutate(!!score_col := as.character(sum(c_across(colnames), na.rm = TRUE))) %>%
+    ungroup()
+}, .init = residuals_proteins)
+
+#write.table(iscores, "~/Projects/4cstudy/Tables/residuals_iscores.csv" , row.names=F, quote=F,na="NA", sep=",")
+```
+
+
+## 4 data merge 
+```{r}
+## add survival time, reachep, and subset of clinical data of interest
+surv_data <- survival_clinical_data %>% select(patid,survival_time, reachep,egfr,ckd1, sex,BLage=age_in_years_at_vdate,bmisds,diagnose2,alburie,salb,hb,bicar,phos,syssds,diasds,syssds_above2,diasds_above2,hyper_class,hyper_treat_group) 
+
+### add residuals of the protein set of interest : residuals, above cutoff, i-score (80th cut-off)
+surv_data <- surv_data %>% right_join(residuals_proteins,by="patid") 
+
+## add the other i-scores with cut off 50-90
+surv_data <- surv_data %>% left_join(iscores %>% select(patid, starts_with("i_score_")),by="patid")
+
+## set types
+surv_data <- surv_data %>% mutate(i_score=as.numeric(i_score), diagnose2=as.factor(diagnose2), hyper_treat_group=as.factor(hyper_treat_group), hyper_class=as.factor(hyper_class),sex=as.factor(sex))
+
+## input for cox regression
+#write.table(surv_data, "~/Projects/4cstudy/Tables/survival_data.csv" , row.names=F, quote=F,na="NA", sep=",")
+```
+
+## 5 Kaplan Meier Curves
+- relation of i-score and eGFR/alburie 
+- kaplan meier curve for each i-score grp: 0 ,1,..,4
+
+### run for protein set of interest
+```{r}
+protein_set <- c("tnfrsf9","pd_l1","cx3cl1","cd40")
+setnames<- c("CD137","PD_L1","CX3CL1","CD40")
+```
+
+for cutoff 50 and 80
+KMS:
+```{r}
+plot_kaplan_meier_iscore(data=surv_data, proteinset = c("tnfrsf9","pd_l1","cx3cl1","cd40"), proteinnames =c("CD137","PD_L1","CX3CL1","CD40"),category = T,cutoff="80",prefix="high_80_residual_",color= c(   "#FFD353FF","#FFB242FF","#BB292CFF") ,fontsize=3.5,survline = "hv")
+
+plot_kaplan_meier_iscore(data=surv_data, proteinset = c("tnfrsf9","pd_l1","cx3cl1","cd40"), proteinnames =c("CD137","PD_L1","CX3CL1","CD40"),category = T,cutoff="50",prefix="high_50_residual_",color= c(  "#FFD353FF","#FFB242FF","#BB292CFF") )
+```
+
+```{r}
+## number of drop outs 
+surv_data %>% ungroup() %>% mutate(iscore_cat= case_when(i_score==0~"0", i_score>0 & i_score<3 ~"1-2",T~ "3-4")) %>% dplyr::count(iscore_cat,reachep) %>% group_by(iscore_cat) %>% mutate(percentage=n/sum(n)) %>% write.table("~/Projects/4cstudy/Tables/dropout_numbers_iscore.csv", sep = ",", row.names = F)
+```
+
+
+
+Boxplot eGFR and alburie
+```{r}
+plot_boxplot_iscore(data=surv_data,proteinset=c("tnfrsf9","pd_l1","cx3cl1","cd40"),proteinnames=c("CD137","PD_L1","CX3CL1","CD40"),prefix="high_80_residual_",cutoff = "80",xlabel=0.8,psize=3.3)
+
+plot_boxplot_iscore(data=surv_data,proteinset=c("tnfrsf9","pd_l1","cx3cl1","cd40"),proteinnames=c("CD137","PD_L1","CX3CL1","CD40"),prefix="high_50_residual_",cutoff = "50",xlabel=0.8,psize=3.3)
+
+```
+
+
+
+
+
+
+KM curves for reaching KRT (splitting endpoint)
+```{r}
+RRTsurv_data <- surv_data %>% left_join(reached_endpoint %>% dplyr::select(patid,RRT)) %>% filter(RRT=="CKD50"| reachep==0)
+
+plot_kaplan_meier_iscore(data=RRTsurv_data, proteinset = c("tnfrsf9","pd_l1","cx3cl1","cd40"), proteinnames =c("CD137","PD_L1","CX3CL1","CD40"),timelimit = c(0,3),category =T,cutoff="80",prefix="high_80_residual_",color= c( "#FFD353FF","#FFB242FF","#BB292CFF") ,fontsize=3.5)
+
+plot_boxplot_iscore(data=RRTsurv_data,proteinset=c("tnfrsf9","pd_l1","cx3cl1","cd40"),proteinnames=c("CD137","PD_L1","CX3CL1","CD40"),prefix="high_80_residual_",cutoff = "80",xlabel=0.8,psize=3.3)
+
+```
+```{r}
+reached_endpoint %>% inner_join(surv_data %>% dplyr::select(patid,i_score)) %>%dplyr::count(RRT, i_score)
+```
+
+
+
+## 6 Residual Visualization
+
+visualizing residuals and cut-offs for the inflammation score definition
+
+```{r}
+names<- c("CD137","PD_L1","CX3CL1","CD40")
+plist<- list()
+for (i in 1:4){
+  p<-protein_set[i]
+  name<- names[i]
+ plist[[p]]<- plot_residual(p,name,savepath="~/Projects/4cstudy/Plots/SurvivalAnalysis/Figure4/residual_plots/")
+}
+
+plist
+```
+# 7 Correlation Plot 
+
+```{r}
+cor_df <- BL_data_bpoffice %>% mutate(alburie=log(alburie+0.01)) %>% dplyr::select(patid,egfr,alburie,crp,salb,phos,hb,diasds,syssds) %>% right_join(olink_data%>% select(CD40=native_cd40,CD137=native_tnfrsf9,PD_L1=native_pd_l1,CX3CL1=native_cx3cl1,patid),.) %>% filter(patid %in% surv_data$patid) %>% select(-patid) 
+
+
+cor_mat <- cor(cor_df,use="complete.obs") 
+
+testRes <- cor.mtest(cor_df, conf.level = 0.95,use="complete.obs")
+```
+
+
+```{r}
+corrplot(cor_mat,
+         p.mat = testRes$p,
+         diag = FALSE,
+         order = "FPC",
+         type = "lower",
+         sig.level = c(0.001, 0.01, 0.05),
+         pch.cex = 0.8,
+         insig = 'label_sig',
+         pch.col = 'grey20',
+         tl.col = "black")
+
+# Allow new plot on top
+par(new = TRUE)
+plot(0, type = "n", axes = FALSE, xlab = "", ylab = "")
+
+# Add the legend
+legend("topright",
+       legend = c("*** p < 0.001", "** p < 0.01", "* p < 0.05"),
+       bty = "n",
+       cex = 0.8)
+```
+
+# 8 Supplement Figure
+
+```{r warning=FALSE}
+source("~/Projects/4cstudy/code_upload/survival_analysis_functions.R")
+
+names<- c("CD137","PD_L1","CX3CL1","CD40")
+plist<- list()
+for (i in 1:4){
+  p<-protein_set[i]
+  name<- names[i]
+ plist[[p]]<- plot_npx_survtime(p,name,savepath="~/Projects/4cstudy/Plots/SurvivalAnalysis/Figure4/residual_plots/")
+}
+
+plist
+```
+

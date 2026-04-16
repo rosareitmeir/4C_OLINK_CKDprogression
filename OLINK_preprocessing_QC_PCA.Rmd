@@ -1,0 +1,426 @@
+---
+title: "olink preprocessing, Qualtiy Control and PCA"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tibble)
+library(ggpubr)
+library(readxl)
+library(paletteer)
+```
+
+## 0. Read files 
+```{r message=FALSE, warning=FALSE}
+setwd("~/Projects/4cstudy")
+olink_file <- read.csv2("~/Projects/4cstudy/ClinicalData/20241112_cohort_4C.csv", sep=",", dec=".")
+olink_metafile <- read_xlsx("~/Projects/4cstudy/ClinicalData/20240917_Olink_layout_AG_Wilck.xlsx") %>% filter(cohort=="4C")
+LOD_file <- read.csv2("~/Projects/4cstudy/ClinicalData/analytes_lod.csv", sep=",", dec=".")
+
+
+olink_file %>% filter(repeated=="yes") %>% distinct(pat_id)
+```
+
+## 1. Data Cleaning 
+
+### Repeated Measurements
+```{r}
+length(unique(olink_file$pat_id))
+pat_with_olink <- unique(olink_file$pat_id)
+
+## adding all with no repeated measuremtns 
+olink_data<-olink_file %>% group_by(pat_id) %>% filter(all(repeated=="no")) 
+
+## 10 patients with  repeated measurements, with changed sample nr , taken the repeated measurement as original consists solely on 0 for all analytes
+filteringout_samples <- olink_file %>% group_by(pat_id) %>% filter(any(repeated=="yes"))  %>% filter(!startsWith(unchanged_sample_nr,"W")) %>% distinct(unchanged_sample_nr) %>% pull(unchanged_sample_nr)
+
+olink_data <- rbind( olink_data , olink_file %>% group_by(pat_id) %>% filter(any(repeated=="yes"))  %>% filter(startsWith(unchanged_sample_nr,"W")))
+
+# change format of olink_data
+olink_data <- olink_data %>% select(unchanged_sample_nr, sample_nr ,pat_id, analytes, value, qc_by_them)  %>% pivot_wider(names_from=analytes, values_from = value)
+```
+
+### Warning Flag
+
+38 patients with warning 
+```{r}
+nrow( olink_data %>% filter(qc_by_them=="WARNING") %>% group_by(pat_id) %>% distinct(pat_id))
+nrow( olink_data %>% filter(qc_by_them=="WARNING") %>% group_by(pat_id) %>% distinct(pat_id))
+
+```
+### Adding Plate 
+
+```{r}
+olink_data<- olink_metafile %>% filter(cohort=="4C") %>% select(sample_nr=sampleNr, plate) %>% full_join(olink_data %>% mutate(sample_nr=as.character(sample_nr)),by="sample_nr")
+
+
+olink_file <- olink_metafile %>% filter(cohort=="4C") %>% select(sample_nr=sampleNr, plate) %>% full_join(olink_file %>% mutate(sample_nr=as.character(sample_nr)),by="sample_nr")
+
+plate_sizes <- olink_file %>%group_by(plate) %>% summarise(n_samples=n_distinct(pat_id))
+
+plate_sizes
+```
+
+
+## 2 LOD 
+
+### sample based
+all patients have some analytes under LOD 
+seemed to occur on every plate
+```{r}
+#LOD_file
+
+olink_file %>% left_join(LOD_file %>% rename(analytes=anlaytes), by= "analytes")  %>% filter(!unchanged_sample_nr %in% filteringout_samples) %>% mutate(underLOD= value < MaxLOD) %>% filter(underLOD) %>% group_by(pat_id,plate) %>% summarise(n_underlod=n_distinct(analytes)) %>% ggplot(aes(y=n_underlod,x=as.character(plate))) + geom_boxplot()
+```
+
+
+max 22% missing analytes, so under the 0.7 treshold 
+```{r}
+olink_file %>% left_join(LOD_file %>% rename(analytes=anlaytes), by= "analytes")  %>% filter(!unchanged_sample_nr %in% filteringout_samples) %>% 
+mutate(underLOD= value < MaxLOD) %>% filter(underLOD) %>% group_by(unchanged_sample_nr) %>% summarise(n_underlod=n_distinct(analytes), perc=n_underlod/92,qc_by_them) %>% arrange(desc(n_underlod)) %>% distinct()
+
+## samples with enough analytes above LOD 
+olink_file %>% left_join(LOD_file %>% rename(analytes=anlaytes), by= "analytes")  %>% filter(!unchanged_sample_nr %in% filteringout_samples) %>% 
+mutate(underLOD= value < MaxLOD) %>% filter(underLOD) %>% group_by(unchanged_sample_nr) %>% summarise(n_underlod=n_distinct(analytes), perc=n_underlod/92,qc_by_them) %>% arrange(desc(n_underlod)) %>% pull(perc) %>% summary(.)
+```
+
+### analytes based
+```{r}
+analytes_occurrence <- olink_file %>% left_join(LOD_file %>% rename(analytes=anlaytes), by= "analytes")  %>% filter(!unchanged_sample_nr %in% filteringout_samples) %>% mutate(underLOD= value < MaxLOD) %>% filter(underLOD) %>% group_by(analytes) %>% count() %>% mutate(perc=n/684) %>% arrange(desc(n)) 
+
+analytes_occurrence
+
+filterout_analytes <- analytes_occurrence %>% filter(perc > 0.7) %>% pull(analytes)
+
+
+## whether this analytes are missing by chance or systematically (ckd status?), see under 5)
+analytes_tobetested <- analytes_occurrence %>% filter(perc > 0.7 & perc <0.9) %>% pull(analytes)
+
+critical_analytes_absent_df <- olink_file%>% left_join(LOD_file %>% rename(analytes=anlaytes), by= "analytes")  %>% filter(!unchanged_sample_nr %in% filteringout_samples) %>% mutate(underLOD= value < MaxLOD) %>% filter(analytes %in% analytes_tobetested) %>% select(pat_id,analytes,underLOD) %>% pivot_wider(names_from=analytes,values_from=underLOD)
+```
+
+how many analytes are not measured on the plates 
+seem to be also similar on the plates
+
+percentage of missing for each analyte on each plate
+
+```{r}
+olink_file %>% left_join(LOD_file %>% rename(analytes=anlaytes), by= "analytes")  %>% filter(!unchanged_sample_nr %in% filteringout_samples) %>% mutate(underLOD= value < MaxLOD) %>% filter(underLOD) %>% group_by(analytes,plate) %>% count(,Missing.Data.freq.) %>% arrange(analytes) %>% left_join(plate_sizes, by="plate") %>% mutate(perc=n/n_samples)
+```
+
+total number of missing analytes per plate 
+```{r}
+olink_file %>% left_join(LOD_file %>% rename(analytes=anlaytes), by= "analytes")  %>% filter(!unchanged_sample_nr %in% filteringout_samples) %>% mutate(underLOD= value < MaxLOD) %>% filter(underLOD) %>% group_by(analytes,plate) %>% count(,Missing.Data.freq.) %>% arrange(analytes)  %>% #filter(!analytes %in% filterout_analytes) %>% 
+ungroup()%>% count(plate)
+
+```
+### Warning flag
+
+warning not based on under LOD, as only 43 of them are from samples flagged with warning 
+```{r}
+nrow(olink_file %>% left_join(LOD_file %>% rename(analytes=anlaytes), by= "analytes")  %>% filter(!unchanged_sample_nr %in% filteringout_samples) %>% mutate(underLOD= value < MaxLOD) %>% filter(underLOD) %>% filter(!analytes %in% filterout_analytes) %>% filter(qc_by_them =="WARNING"))
+
+## warning not based on lod 
+```
+
+```{r}
+ggplot(olink_file %>% filter(qc_by_them!="PASS" & !unchanged_sample_nr %in% filteringout_samples) , aes(x=reorder(pat_id,value,mean), y=value)) + geom_boxplot()
+
+## enough values above LOD
+olink_file%>% left_join(LOD_file %>% rename(analytes=anlaytes), by= "analytes")  %>% mutate(underLOD= value < MaxLOD) %>% filter(qc_by_them!="PASS" & !unchanged_sample_nr %in% filteringout_samples) %>% group_by(pat_id) %>%  filter(underLOD) %>% count(underLOD)
+```
+
+
+```{r}
+ggplot(rbind(olink_file %>% filter(qc_by_them=="PASS") %>% group_by(unchanged_sample_nr) %>% distinct(unchanged_sample_nr)  %>% pull(unchanged_sample_nr) %>% sample(.,10)  %>% { filter(olink_file, unchanged_sample_nr %in% .) }   ,
+           olink_file %>% filter(qc_by_them!="PASS") %>% filter(!unchanged_sample_nr %in% filteringout_samples)%>% group_by(unchanged_sample_nr) %>% distinct(unchanged_sample_nr)  %>% pull(unchanged_sample_nr) %>% sample(.,10)  %>% { filter(olink_file, unchanged_sample_nr %in% .) } )  , 
+       aes(x=interaction(unchanged_sample_nr,qc_by_them), y=value, color=qc_by_them)) + geom_boxplot() + theme_classic()
+
+olink_file %>% filter(!unchanged_sample_nr %in% filteringout_samples)%>% ggplot(aes(x=qc_by_them, y=value)) + geom_boxplot() + stat_compare_means()
+
+```
+
+
+## 3 Imputation
+
+taken the square root of max LOD
+issue: since value and LOD are log transformed, can not take square root for negative LODs
+therefore reverse log transformation and taking the square root and log transform then again 
+
+rawscale_value are those imputated values 
+logscale_value taken square root of log maxLOD, hence some with missing value 
+```{r}
+## add LOD values for each analyte, create imputation on raw and on log value of LOD
+olink_file <- olink_file %>% left_join(LOD_file %>% rename(analytes=anlaytes), by= "analytes")  %>% filter(!unchanged_sample_nr %in% filteringout_samples & !analytes %in% filterout_analytes)  %>% mutate(underLOD=value < MaxLOD) %>%
+mutate( expLOD=exp(MaxLOD)) %>% 
+mutate(imput_raw_value=case_when(underLOD ~ log(sqrt(expLOD)), T ~ value))  %>%
+mutate(imput_log_value = case_when(underLOD ~ sqrt(MaxLOD), T ~ value))
+
+## change format of olink file 
+olink_data <- olink_file %>% select(unchanged_sample_nr,plate,qc_by_them, pat_id, analytes, unchanged=value, rawscale=imput_raw_value, logscale=imput_log_value) %>% pivot_wider(
+    names_from = analytes,
+    values_from = c(unchanged, rawscale, logscale),
+    names_glue = "{.value}_{analytes}"
+  )
+
+## input for all other analysis
+#write.table(olink_data, "~/Documents/4CStudy/Tables/OLINK_data.tsv", row.names=F, quote=F,na="NA", sep="\t")
+```
+
+
+## 4 PCA
+### functions
+```{r}
+## calvcualtes the prinicpial components of the given data
+calculate_PCA <- function(data){
+pca_result <- prcomp(data %>% dplyr::select(-pat_id), scale. = F )  
+# Step 2: Prepare PCA results for plotting
+# Get the principal components (PCs) and bind with patient IDs
+pca_df <- as.data.frame(pca_result$x)
+pca_df$pat_id <-data   %>% pull(pat_id)
+
+return(pca_df)
+}
+
+# get the variance covered by the first and second principal component, for axis description
+calculate_PCs <-function(data){
+pca_result <- prcomp(data %>% select(-pat_id), scale. = F )  
+
+variance_explained <- summary(pca_result)$importance[2, 1:2] * 100  # Convert to percentage
+pc1_var <- round(variance_explained[1], 2)
+pc2_var <- round(variance_explained[2], 2)
+
+return(c(pc1_var,pc2_var))
+}
+```
+
+### General Checks
+any clustering based on plate and quality control flags ? 
+
+```{r}
+# calculate PCs with the "raw" imputated npx values, and then join with plate and qc info data for coloring
+raw_pca_df <- calculate_PCA(olink_data %>% select(pat_id, starts_with("raw"))) %>% 
+  right_join(olink_data %>% select(pat_id,plate,qc_by_them),., by="pat_id")
+
+# get the variance of first,second PCs
+raw_pcs <- calculate_PCs(olink_data %>% select(pat_id, starts_with("raw")))
+```
+
+
+```{r}
+ggplot(raw_pca_df, aes(x = PC1, y = PC2, color = qc_by_them)) +
+  geom_point(size = 3) +
+  theme_minimal() +  scale_color_viridis_d()  +
+  labs(
+    x = paste0("PC 1 (", raw_pcs[1], "% variance)"),
+    y = paste0("PC 2 (", raw_pcs[2], "% variance)")
+  )
+
+ggplot(raw_pca_df, aes(x = PC1, y = PC2, color = as.character(plate))) +
+  geom_point(size = 3) +
+  theme_minimal() +  scale_color_viridis_d()  +
+  labs(
+    x = paste0("PC 1 (", raw_pcs[1], "% variance)"),
+    y = paste0("PC 2 (", raw_pcs[2], "% variance)")
+  )
+```
+
+
+### colored by CKD
+
+```{r include=T}
+## clinical data at study entrance (BL = baseline), adding information within ggplot
+BL_data_bpoffice <-read.csv2("~/Projects/4cstudy/Tables/BL_data_bpoffice.csv",  sep = ",",header=T)
+```
+
+for better visualization,excluding 8 patients of ckd 2 stage (> 60 eGFR)
+```{r}
+ggplot(
+  raw_pca_df %>% 
+    rename(patid = pat_id) %>% 
+    right_join(BL_data_bpoffice, ., by = "patid") %>% 
+    mutate(egfr = as.numeric(egfr)) %>%  filter(egfr < 60), 
+  
+) + # Scatterplot points
+ geom_point(aes(x = PC1, y = PC2, color = egfr), shape=16, size = 2.5) +
+  # Add median points for each group
+  geom_point(
+    data = raw_pca_df %>% rename(patid = pat_id) %>% right_join(BL_data_bpoffice, ., by = "patid") %>%
+      mutate(egfr = as.numeric(egfr)) %>%  filter(egfr < 60) %>%  group_by(ckd1) %>% 
+      summarise(  median_PC1 = median(PC1, na.rm = TRUE), median_PC2 = median(PC2, na.rm = TRUE)),
+    aes(x = median_PC1, y = median_PC2, fill=ckd1),  shape=24 ,size=5,color="white"
+  ) +
+  # Classic theme and color scale
+  theme_classic() +  
+  scale_color_viridis_c() +
+  scale_fill_viridis_d(direction=-1)+
+  # Axis labels
+  labs(
+    x = paste0("PC 1 (", raw_pcs[1], "% variance)"),
+    y = paste0("PC 2 (", raw_pcs[2], "% variance)")
+  )
+
+#ggsave("~/Documents/4CStudy/Plots/PCA_egfr_CKDmedian.pdf", width=7,height=5)
+```
+
+all patients, from ckd stage 2 to 5
+```{r}
+ggplot(raw_pca_df %>% rename(patid=pat_id)%>% left_join(BL_data_bpoffice, by="patid") %>% filter(!is.na(ckd1)), aes(x = PC1, y = PC2, color = ckd1)) +
+  geom_point(size = 3) +
+  theme_minimal() +  scale_color_viridis_d()  +
+  labs(
+    x = paste0("PC 1 (", raw_pcs[1], "% variance)"),
+    y = paste0("PC 2 (", raw_pcs[2], "% variance)")
+  )
+```
+
+### colored by Diagnose
+adding info from BL table and changing names of diagnose for "Nephloss"
+```{r}
+ggplot(raw_pca_df %>% rename(patid=pat_id)%>% left_join(BL_data_bpoffice, by="patid") %>% mutate(diagnose2=case_when(diagnose2=="Nephloss"~"postAKI/HUS",T~diagnose2)) %>%
+  mutate(diagnose2=factor(diagnose2, levels=rev(c("Other", "postAKI/HUS", "Glomerulopathies","Tubint", "CAKUT")))), aes(x = PC1, y = PC2, color = diagnose2)) +
+  geom_point(size = 3) +
+  theme_classic() +  scale_color_paletteer_d("PrettyCols::Bold", name="")  +
+  labs(
+    x = paste0("PC 1 (", raw_pcs[1], "% variance)"),
+    y = paste0("PC 2 (", raw_pcs[2], "% variance)")
+  ) + geom_point(
+    data = raw_pca_df %>% rename(patid = pat_id) %>% right_join(BL_data_bpoffice, ., by = "patid") %>%
+      mutate(diagnose2=case_when(diagnose2=="Nephloss"~"postAKI/HUS",T~diagnose2)) %>%
+  mutate(diagnose2=factor(diagnose2, levels=rev(c("Other", "postAKI/HUS", "Glomerulopathies","Tubint", "CAKUT")))) %>%
+       group_by(diagnose2) %>% 
+      summarise(  median_PC1 = median(PC1, na.rm = TRUE), median_PC2 = median(PC2, na.rm = TRUE)),
+    aes(x = median_PC1, y = median_PC2, fill=diagnose2),  shape=24 ,size=5, color="white"
+  ) +
+  # Classic theme and color scale
+  theme_classic() +  
+  paletteer::scale_fill_paletteer_d("PrettyCols::Bold", name="")+
+  # Axis labels
+  labs(
+    x = paste0("PC 1 (", raw_pcs[1], "% variance)"),
+    y = paste0("PC 2 (", raw_pcs[2], "% variance)")
+  )
+
+#ggsave("~/Documents/4CStudy/Plots/PCA_disease_withmedian.pdf", width=7,height=5)
+```
+
+### colored by site
+colored by country of site (turkey,france,germany,...)
+```{r}
+ggplot(raw_pca_df %>% rename(patid=pat_id)%>% left_join(BL_data_bpoffice, by="patid") , aes(x = PC1, y = -PC2, color = as.character(country))) +
+  geom_point(size = 3) +
+  theme_classic() +  paletteer::scale_color_paletteer_d("MoMAColors::Klein", name="") +
+  labs(
+    x = paste0("PC 1 (", raw_pcs[1], "% variance)"),
+    y = paste0("PC 2 (", raw_pcs[2], "% variance)")
+  ) +
+  geom_point(
+    data = raw_pca_df %>% rename(patid = pat_id) %>% right_join(BL_data_bpoffice, ., by = "patid") %>%
+       group_by(country) %>% 
+      summarise(  median_PC1 = median(PC1, na.rm = TRUE), median_PC2 = median(PC2, na.rm = TRUE)),
+    aes(x = median_PC1, y = median_PC2, fill=country),  shape=24 ,size=5, color="white"
+  ) +
+  # Classic theme and color scale
+  theme_classic() +  
+  paletteer::scale_fill_paletteer_d("MoMAColors::Klein", name="")+
+  # Axis labels
+  labs(
+    x = paste0("PC 1 (", raw_pcs[1], "% variance)"),
+    y = paste0("PC 2 (", raw_pcs[2], "% variance)")
+  )
+#ggsave("~/Documents/4CStudy/Plots/PCA_country_withmedian.pdf", width=7,height=5)
+```
+
+### colored by proteinuria
+```{r}
+raw_pca_df %>% rename(patid=pat_id)%>% left_join(BL_data_bpoffice, by="patid") %>% filter(!is.na(alburie))%>%
+  mutate(alburie=as.numeric(alburie)) %>%mutate(acr_grp= case_when(alburie< 30 ~"A1", alburie>300~"A3",T~"A2") ) %>%
+ggplot( ., aes(x = PC1, y = -PC2, color = log(alburie+0.1))) +
+  geom_point(size = 3) +
+  theme_classic() +
+  geom_point(
+    data = raw_pca_df %>% rename(patid = pat_id) %>% right_join(BL_data_bpoffice, ., by = "patid") %>% filter(!is.na(alburie))%>%
+      mutate(acr_grp= case_when(as.numeric(alburie)< 30 ~"A1",as.numeric(alburie)>300~"A3",T~"A2") ) %>%
+    # mutate(acr_grp=as.character(ntile(alburie,6))) %>%
+       group_by(acr_grp) %>% 
+      summarise(  median_PC1 = median(PC1, na.rm = TRUE), median_PC2 = -median(PC2, na.rm = TRUE)),
+    aes(x = median_PC1, y = median_PC2, fill=acr_grp),  shape=24 ,size=5, color="white") +
+  # Classic theme and color scale
+  theme_classic() +  
+  scale_color_viridis_c() + scale_fill_viridis_d()+
+  # Axis labels
+  labs(
+    x = paste0("PC 1 (", raw_pcs[1], "% variance)"),
+    y = paste0("PC 2 (", raw_pcs[2], "% variance)")
+  )
+
+
+```
+### colored by sex 
+```{r}
+raw_pca_df %>% rename(patid=pat_id)%>% left_join(BL_data_bpoffice, by="patid") %>% filter(!is.na(sex)) %>%
+ggplot( ., aes(x = PC1, y = -PC2, color = sex)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  geom_point(
+    data = raw_pca_df %>% rename(patid = pat_id) %>% right_join(BL_data_bpoffice, ., by = "patid")   %>% filter(!is.na(sex)) %>%
+       group_by(sex) %>% 
+      summarise(  median_PC1 = median(PC1, na.rm = TRUE), median_PC2 = -median(PC2, na.rm = TRUE)),
+    aes(x = median_PC1, y = median_PC2, fill=sex),  shape=24 ,size=5, color="white") +
+  # Classic theme and color scale
+  theme_classic() +  
+  # Axis labels
+  labs(
+    x = paste0("PC 1 (", raw_pcs[1], "% variance)"),
+    y = paste0("PC 2 (", raw_pcs[2], "% variance)")
+  ) +
+ paletteer::scale_fill_paletteer_d("PrettyCols::Bold", name="") + paletteer::scale_color_paletteer_d("PrettyCols::Bold", name="")
+
+
+```
+
+### colored by age
+```{r}
+median<- median(BL_data_bpoffice %>% filter(!is.na(age_in_years_at_vdate)) %>% 
+         mutate(age_in_years_at_vdate=as.numeric(age_in_years_at_vdate)) %>%
+         pull(age_in_years_at_vdate))
+
+
+raw_pca_df %>% rename(patid=pat_id)%>% left_join(BL_data_bpoffice, by="patid") %>% filter(!is.na(age_in_years_at_vdate)) %>%  mutate(age_in_years_at_vdate=as.numeric(age_in_years_at_vdate)) %>%
+ggplot( ., aes(x = PC1, y = -PC2, color = age_in_years_at_vdate)) +
+  geom_point(size = 3) +
+  theme_classic() +
+  geom_point(
+    data = raw_pca_df %>% rename(patid = pat_id) %>% right_join(BL_data_bpoffice, ., by = "patid")   %>% filter(!is.na(age_in_years_at_vdate)) %>%
+       mutate( age_above= if_else(median(age_in_years_at_vdate) <age_in_years_at_vdate, "yes", "no")) %>% group_by(age_above)%>%
+      summarise(  median_PC1 = median(PC1, na.rm = TRUE), median_PC2 = -median(PC2, na.rm = TRUE)),
+    aes(x = median_PC1, y = median_PC2, fill=age_above),  shape=24 ,size=5, color="white") +
+  # Classic theme and color scale
+  theme_classic() +  
+  # Axis labels
+  labs(
+    x = paste0("PC 1 (", raw_pcs[1], "% variance)"),
+    y = paste0("PC 2 (", raw_pcs[2], "% variance)"),
+    color="age in years",
+    fill=paste0("age < median age of ", round(median,2))
+  ) +
+ scale_colour_viridis_c() + scale_fill_viridis_d()
+
+
+
+```
+
+## 5 Missing Proteins
+7 proteins with a missing rate of 70% up to 90% 
+by chance or systemtically (kidney damage?)
+defined under 2) analytes based
+have a look on whether those proteins are missing more or less in certain ckd stages
+```{r}
+critical_analytes_absent_df %>% rename(patid=pat_id) %>% left_join(BL_data_bpoffice,.,by="patid") %>% group_by(ckd1) %>%   summarise(across(analytes_tobetested, ~sum(.x, na.rm = TRUE)/n())) %>% ungroup() %>% gather(-ckd1,key="protein", value="value" ) %>% 
+  ggplot(aes(x=protein,fill=ckd1, y=value)) + geom_bar(stat="identity", position="dodge") + theme_classic() +   scale_fill_paletteer_d("PrettyCols::Bold", name="CKD stage") + ylab("Percentage of missing meausrements") + xlab("")
+```

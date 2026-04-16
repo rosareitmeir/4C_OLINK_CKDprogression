@@ -1,0 +1,394 @@
+---
+title: "Protein Network and I-score Subcohorts"
+output:
+  html_document:
+    df_print: paged
+---
+
+more detailed description of the subcohorts (inflammation degree)
+```{r include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(paletteer)
+library(metadeconfoundR)
+library(fastDummies)
+library(stringr)
+library(tibble)
+library(igraph)
+library(ggraph)
+theme_classic_modified <- function(){
+  theme_classic() %+replace%
+    theme(strip.placement="outside", 
+                           strip.text.y.left = element_text(angle = 0,size=11),
+                           strip.background.y=element_rect(color = NA), 
+                           strip.background.x=element_rect(color = NA),
+                           legend.position = "none") 
+}
+```
+
+functions
+```{r}
+plot_distribution <- function(data,x="i_score_80_cat",fill,savepath=NULL){
+## chi sqaure test
+ contingency_table <- table(data %>% pull(!!sym(x)),  data %>% pull(!!sym(fill)))
+ print(contingency_table)
+chisqrtest <- chisq.test(contingency_table)
+
+plot <- data%>% dplyr::count(!!sym(x),!!sym(fill)) %>% group_by(!!sym(x)) %>% mutate(perc=n/sum(n)) %>% 
+  ggplot(aes(x=!!sym(x),y=perc,fill=!!sym(fill))) + 
+  geom_col(position=position_stack()) + 
+  geom_text(aes(label=n), position = position_stack(vjust =0.5), size =3.5, color="white") + 
+  theme_classic() + scale_fill_viridis_d() + 
+  labs(x="", y="", subtitle=paste0("chisquare test: X: ",round(chisqrtest$statistic,2),", p-val: ", round( chisqrtest$p.value,2)))
+
+if(!is.null(savepath)){
+  ggsave(paste0(savepath,"bar_distrib_",x,"_",fill,".pdf"),plot, width = 5.5,height=4.6)
+}
+return(plot)
+}
+```
+
+## 0 Data
+```{r}
+### defined inflammation score with a cutoff of 80th, based on egfr and proteinuria -> 660 patients 
+coxdata <-  read.csv("~/Projects/4cstudy/Tables/survival_data.csv",  sep = ",",header=T)
+coxdata <- coxdata %>% mutate(i_score_80_cat= case_when(i_score==0~"0",i_score==1 | i_score==2~"1-2",T~"3-4"))
+
+olink_data <- read.csv2("~/Projects/4cstudy//Tables/OLINK_data.csv",  sep = ",",header=T) %>% arrange(pat_id) %>% rename(patid=pat_id) %>% mutate(across(starts_with("rawscale"), as.numeric))
+
+### BL_data_bpoffice -> baseline table based on investigation file , more information than investigation_file, end product of the Clinical Data Preparation script, including medication, hypertension,...
+BL_data_bpoffice <-read.csv2("~/Projects/4cstudy/Tables/BL_data_bpoffice.csv",  sep = ",",header=T) %>% filter(patid != 737) %>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))
+
+labels <- read_excel("~/Projects/4cstudy/ClinicalData/analyte_abbrev_HB.xlsx") 
+```
+
+```{r}
+coxdata <- coxdata %>% mutate(i_score_80_cat =case_when(i_score_80==0~"0",i_score_80>=1 & i_score_80<3~ "1-2",T~"3-4"))
+```
+
+## 1  Continuous Variables
+
+table with mean, sd, and number of missing values
+```{r} 
+coxdata%>% group_by(i_score_80_cat) %>% 
+summarise(across(c(BLage,egfr,alburie,salb,hb,bicar,phos,syssds,diasds,bmisds), list(mean = mean, sd = sd),na.rm=T)) %>% left_join(coxdata%>% group_by(i_score_80_cat) %>% 
+summarise(across(c(BLage,egfr,alburie,salb,hb,bicar,phos,syssds,diasds,bmisds), ~sum(is.na(.)),.names = "{.col}_NAs"))   )   
+```
+
+### metadeconfoundR
+running metadeconfoundR ( confounding not relevant here, but is way to iterate over the naive association and plotting heatmap )
+```{r}
+featuredata <- coxdata %>%left_join(BL_data_bpoffice%>% dplyr::select(patid,lvmi,imt_sds_a,pwv_sds_a,sum_AHT,sum_medication))%>%
+  dplyr::select(patid,survival_time, BLage,bmisds,alburie,salb,hb,bicar,phos,syssds,diasds,sum_AHT,sum_medication,starts_with("residual"))   %>% dplyr::select(-patid)
+
+labels_heatmap <- data.frame(machine= names(featuredata), human= c(names(featuredata)[1:12],paste0("res. ", labels$name )))
+
+
+results<- MetaDeconfound(
+  featureMat = featuredata, 
+  metaMat = coxdata%>% dummy_cols("i_score_80_cat",remove_first_dummy = T,remove_selected_columns = T) %>% dplyr::select(starts_with("i_score_80"),high_80_residual_tnfrsf9,high_80_residual_cd40,high_80_residual_cx3cl1,high_80_residual_pd_l1,egfr) , returnLong = T, logLevel = "ERROR"
+)
+```
+
+
+
+
+```{r}
+BuildHeatmap(results,reOrder = "feat",featureNames=labels_heatmap) + labs(x="",y="",title="")
+```
+### boxplots
+```{r}
+coxdata %>% pivot_longer(c(bmisds,salb,phos,hb), names_to="key",values_to="val") %>% ggplot(aes(x=i_score_80_cat,y=val,fill=i_score_80_cat)) + 
+  geom_boxplot()+ facet_wrap(~key,scales="free_y") +  scale_fill_manual(values=c( "#FFD353FF","#FFB242FF","#BB292CFF"), name="i-score 80") + theme_classic_modified() + ggpubr::stat_compare_means(size=3) + ylab("") + xlab("i-score")
+```
+
+
+
+
+
+## 2 Categorical Variables
+```{r}
+path <- "~/Projects/4cstudy/Plots/Figure5/"
+```
+
+sex
+```{r}
+BL_data_bpoffice %>% right_join(coxdata%>%dplyr::select(patid,i_score_80_cat)) %>% 
+dplyr::count(i_score_80_cat,sex) %>% group_by(i_score_80_cat) %>% mutate(perc=n/sum(n))
+plot_distribution(data=BL_data_bpoffice %>% right_join(coxdata %>% mutate(i_score_80=as.character(i_score_80_cat))%>%dplyr::select(patid,i_score_80)) , fill="sex", x="i_score_80", savepath = path)
+```
+
+
+### Hypertension
+
+
+```{r}
+#on AHT or not
+BL_data_bpoffice %>% right_join(coxdata%>%dplyr::select(patid,i_score_80_cat,i_score_80)) %>% 
+dplyr::count(i_score_80_cat,AHT) %>% group_by(i_score_80_cat) %>% mutate(perc=n/sum(n))
+# hypertensive
+BL_data_bpoffice %>% right_join(coxdata%>%dplyr::select(patid,i_score_80_cat,i_score_80)) %>% 
+dplyr::count(i_score_80_cat,hyper_class) %>% group_by(i_score_80_cat) %>% mutate(perc=n/sum(n))
+```
+
+```{r}
+## hypertension group: hypertension (yes, no), treated (yes,no)
+plot_distribution(data=BL_data_bpoffice %>% right_join(coxdata%>%dplyr::select(patid,i_score_80_cat)) , fill="hyper_treat_group",savepath = path) 
+
+## number of anti hypertensive drugs
+plot_distribution(data=BL_data_bpoffice %>% mutate(sum_AHT=as.character(sum_AHT)) %>% right_join(coxdata%>%dplyr::select(patid,i_score_80_cat)) , fill="sum_AHT",savepath = path)
+```
+
+
+```{r}
+## cvd manifestations
+plot_distribution(data=BL_data_bpoffice %>% group_by(patid) %>% mutate(sum_cvd= as.character(sum(lvmi_critical+imt_sds_a_above2+pwv_sds_a_above2,na.rm=T))) %>% ungroup() %>% right_join(coxdata%>%dplyr::select(patid,i_score_80_cat)) , fill="sum_cvd",savepath = path) 
+```
+```{r}
+## all type of medication
+plot_distribution(data=BL_data_bpoffice %>% mutate(sum_medication=if_else(sum_medication<=2,as.character(sum_medication),"3 or more")) %>% right_join(coxdata%>%dplyr::select(patid,i_score_80_cat)) , fill="sum_medication",savepath = path) 
+```
+```{r}
+## RAS inhibitor
+plot_distribution(data=BL_data_bpoffice %>% filter(!is.na(medigr_RAS.inhibitors)) %>% mutate(RAS=as.character(medigr_RAS.inhibitors)) %>% inner_join(coxdata%>%dplyr::select(patid,i_score_80_cat)) , fill="RAS",savepath = path) 
+```
+```{r}
+## immunsuppressive
+plot_distribution(data=BL_data_bpoffice %>% filter(!is.na(medigr_Immunsuppressiva)) %>% mutate(immunsuppressiva=as.character(medigr_Immunsuppressiva)) %>% inner_join(coxdata%>%dplyr::select(patid,i_score_80_cat)) , fill="immunsuppressiva",savepath = path) 
+```
+
+
+### underlying disease
+
+```{r message=FALSE, warning=FALSE}
+plot_distribution(data=BL_data_bpoffice %>% right_join(coxdata%>%dplyr::select(patid,i_score_80_cat)) , fill="diagnose2") + scale_fill_paletteer_d("PrettyCols::Bold", name="")
+
+plot_distribution(data=BL_data_bpoffice %>% right_join(coxdata%>%dplyr::select(patid,i_score_80) %>%mutate(i_score_80=as.character(i_score_80))) , x="diagnose2",fill="i_score_80", savepath = path) 
+
+```
+
+### country 
+
+```{r message=FALSE, warning=FALSE}
+plot_distribution(data=BL_data_bpoffice %>% right_join(coxdata%>%dplyr::select(patid,i_score_80_cat)) , fill="country",savepath = path) 
+```
+
+
+##  3 Protein Profile
+### PCA 
+```{r}
+x<- olink_data%>% filter(patid %in% coxdata$patid) %>% dplyr::select(patid,starts_with("raw")) %>% arrange(patid) %>% column_to_rownames("patid")
+
+pca_df <- prcomp(x , scale. = F ) 
+variance_explained <- summary(pca_df)$importance[2, 1:2] * 100  # Convert to percentage
+pc1_var <- round(variance_explained[1], 2)
+pc2_var <- round(variance_explained[2], 2)
+
+pca_df <- as.data.frame(pca_df$x)
+pca_df$patid <-as.numeric(rownames(x))
+
+
+pca_df %>%  left_join(coxdata) %>% ggplot(aes(x=PC1,y=PC2)) + geom_point(aes(color=i_score_80_cat)) + theme_classic() + geom_point(
+    data = pca_df  %>% right_join(coxdata, ., by = "patid") %>%   
+      group_by(i_score_80_cat) %>%  
+      summarise(  median_PC1 = median(PC1, na.rm = TRUE), median_PC2 = median(PC2, na.rm = TRUE)),  
+    aes(x = median_PC1, y = median_PC2, fill=i_score_80_cat),  shape=24 ,size=5,color="white" )+ ggtitle("PCA npx protein values") + 
+  labs(
+    x = paste0("PC 1 (", pc1_var, "% variance)"),
+    y = paste0("PC 2 (", pc2_var, "% variance)")
+  )+ scale_color_manual(values=c( "#FFD353FF","#FFB242FF","#BB292CFF"), name="i-score 80")+ scale_fill_manual(values=c( "#FFD353FF","#FFB242FF","#BB292CFF"),name="i-score 80")
+```
+
+```{r}
+x<- coxdata%>% filter(patid %in% coxdata$patid) %>% dplyr::select(patid,starts_with("residual")) %>% arrange(patid) %>% column_to_rownames("patid")
+pca_df <- prcomp(x , scale. = F ) 
+variance_explained <- summary(pca_df)$importance[2, 1:2] * 100  # Convert to percentage
+pc1_var <- round(variance_explained[1], 2)
+pc2_var <- round(variance_explained[2], 2)
+
+pca_df <- as.data.frame(pca_df$x)
+pca_df$patid <-as.numeric(rownames(x))
+
+
+pca_df %>%  left_join(coxdata) %>% ggplot(aes(x=PC1,y=PC2)) + geom_point(aes(color=i_score_80_cat)) + theme_classic() + geom_point(
+    data = pca_df  %>% right_join(coxdata, ., by = "patid") %>%
+      group_by(i_score_80_cat) %>% 
+      summarise(  median_PC1 = median(PC1, na.rm = TRUE), median_PC2 = median(PC2, na.rm = TRUE)),
+    aes(x = median_PC1, y = median_PC2, fill=i_score_80_cat),  shape=24 ,size=5,color="white"
+  ) + ggtitle("PCA residual protein values") +  labs(
+    x = paste0("PC 1 (", pc1_var, "% variance)"),
+    y = paste0("PC 2 (", pc2_var, "% variance)")
+  )+ scale_color_manual(values=c( "#FFD353FF","#FFB242FF","#BB292CFF"), name="i-score 80")+ scale_fill_manual(values=c( "#FFD353FF","#FFB242FF","#BB292CFF"),name="i-score 80")
+```
+
+## 4 Correlation Network
+```{r}
+library(pheatmap)
+library(qgraph)
+library(Hmisc)   # for rcorr
+library(ppcor)
+```
+
+create protein networks based on the eGFR residuals of the protein levels ( controlling for eGFR influence)
+and also correct the pairwise correlation on the presences/absence of othe proteins (partial correlation)
+
+```{r}
+## all samples
+x<- coxdata%>% filter(patid %in% coxdata$patid) %>% dplyr::select(patid,starts_with("residual")) %>% arrange(patid) %>% column_to_rownames("patid")
+names(x) <- labels$name
+
+```
+
+Partial Correlation Network:
+conditional correlation, adjusted by other proteins
+```{r}
+qg<-qgraph(cor(x), layout = "spring", sampleSize=nrow(x),threshold="fdr",
+       labels = colnames(x), theme = "classic", graph="pcor"
+      ,color = ifelse(colnames(x) %in% c("CD40","PD-L1","CX3CL1","CD137"), "lightblue", "lightgrey"),legend=T,
+  vsize = ifelse(colnames(x) %in% c("CD40","PD-L1","CX3CL1","CD137"), 6, 5))
+
+```
+
+or alternatively ego networks 
+showing correlation of the four proteins with other proteins
+```{r}
+plot_egonetwork <- function(ego){
+  adj <- getWmat(qg)
+
+
+neighbors <- which(adj[ego, ] != 0)
+subnodes <- c(ego, names(neighbors))
+
+# plot subnetwork
+return(qgraph(adj[subnodes, subnodes], labels = subnodes, theme = "classic", layout = "spring"))
+}
+
+plot_egonetwork("CD40")
+plot_egonetwork("PD-L1")
+plot_egonetwork("CD137")
+plot_egonetwork("CX3CL1")
+
+```
+
+connecting ego networks to one
+showing a subset of the whole partial correlation network 
+```{r}
+ adj <- getWmat(qg)
+neighbors <- as.data.frame(adj[c("CD40","PD-L1","CX3CL1","CD137"), ] != 0) %>% dplyr::select(where(any))#, -c("CD40","PD-L1","CX3CL1","CD137")) 
+subnodes <- names(neighbors)
+qgraph(adj[subnodes, subnodes], labels = subnodes,legend=T
+       , layout = "spring",
+       color = ifelse(colnames(adj[subnodes, subnodes]) %in% c("CD40","PD-L1","CX3CL1","CD137"), "lightblue", "lightgrey"),
+  vsize = ifelse(colnames(adj[subnodes, subnodes]) %in% c("CD40","PD-L1","CX3CL1","CD137"), 6, 5))
+
+```
+
+
+
+```{r}
+centralityTable(qg)
+```
+
+
+```{r}
+centralityTable(qg) %>% ggplot(aes(x=value)) + geom_density() + facet_wrap(~measure)
+centralityTable(qg) %>% group_by(measure) %>% summarise(mean=mean(value,na.rm=T), median=median(value,na.rm=T))
+```
+
+
+```{r}
+centralityTable(qg) %>% filter(measure=="Betweenness") %>% arrange(desc(value))
+centralityTable(qg) %>% filter(measure=="Strength") %>% arrange(desc(value))
+centralityTable(qg) %>% filter(measure=="Closeness") %>% arrange(desc(value))
+centralityTable(qg) %>% filter(measure=="ExpectedInfluence") %>% arrange(desc(value))
+
+```
+
+
+calculate parital correaltion, get p-values and adjust them (fdr control)
+```{r warning=FALSE}
+X <- as.matrix(x)  # patients × proteins matrix
+P <- ncol(X)
+
+# Initialize matrices
+## no lasso regualization, overfitting
+pcor_mat <- matrix(NA, nrow = P, ncol = P, dimnames = list(colnames(X), colnames(X)))
+pval_mat <- matrix(NA, nrow = P, ncol = P, dimnames = list(colnames(X), colnames(X)))
+
+for (i in 1:(P-1)) {
+  for (j in (i+1):P) {
+    res <- pcor.test(X[,i], X[,j], X[, -c(i,j)])
+    pcor_mat[i,j] <- pcor_mat[j,i] <- res$estimate
+    pval_mat[i,j] <- pval_mat[j,i] <- res$p.value
+  }
+}
+diag(pcor_mat) <- 1
+diag(pval_mat) <- 0
+```
+```{r}
+pval_vec <- pval_mat[upper.tri(pval_mat)]
+fdr_vec <- p.adjust(pval_vec, method = "fdr")
+
+fdr_mat <- matrix(NA, nrow = P, ncol = P, dimnames = list(colnames(X), colnames(X)))
+fdr_mat[upper.tri(fdr_mat)] <- fdr_vec
+fdr_mat <- t(fdr_mat)
+fdr_mat[upper.tri(fdr_mat)] <- fdr_vec
+diag(fdr_mat) <- 0
+```
+
+
+
+```{r}
+edges <- which(upper.tri(pcor_mat), arr.ind = TRUE)
+edge_df <- data.frame(
+  from   = colnames(X)[edges[,1]],
+  to     = colnames(X)[edges[,2]],
+  weight = abs(pcor_mat[edges]),
+  og_weight=pcor_mat[edges],
+  fdr    = fdr_mat[edges]
+) %>% dplyr::filter(fdr < 0.05)
+
+node_df <- data.frame(
+  name = colnames(pcor_mat),
+  group = ifelse(colnames(pcor_mat) %in% c("CD40","PD-L1","CX3CL1","CD137"),
+                 "Target", "Other")
+)
+```
+
+### figure 5 network plot
+
+from created network, showing subst of the big nwtoqrk concentrating on the significant correlations of our 4 proteins 
+```{r}
+subset_edge_df <- edge_df %>% filter( to %in% c("CD40","PD-L1","CX3CL1","CD137") | from %in% c("CD40","PD-L1","CX3CL1","CD137") ) %>% mutate(og_weight=weight,weight=abs(weight))
+
+#subset_edge_df <- edge_df %>% filter( to %in% union(subset_edge_df$from,subset_edge_df$to) & from %in% union(subset_edge_df$from,subset_edge_df$to) ) %>% mutate(og_weight=weight,weight=abs(weight)) 
+subset_node_df <- node_df %>% filter(name %in% union(subset_edge_df$from, subset_edge_df$to))
+
+subset_g <- graph_from_data_frame(d = subset_edge_df, vertices = subset_node_df, directed = FALSE)
+
+graph<- ggraph(subset_g) + 
+  ggraph::geom_edge_link(aes(width = abs(weight), color = og_weight)) +  
+  ggraph::geom_node_point(aes(color = group), size = 9) +
+  ggraph::geom_node_text(aes(label = name), repel = F, size = 2) +
+  scale_edge_color_gradient2(low =  "#00D4FF",mid="#0567B8", high = "#08298E", midpoint = 0.175,name="partial correlation") +
+  scale_edge_width(range = c(0.2, 2),name="partial correlation") + theme_graph() + scale_color_manual(values=c("#DEDEDE","#AE7CCF")) 
+
+```
+
+
+whole network 
+```{r}
+g <- graph_from_data_frame(d = edge_df, vertices = node_df, directed = FALSE)
+
+graph<- ggraph(g) + 
+  ggraph::geom_edge_link(aes(width = abs(weight), color = og_weight)) +  
+  ggraph::geom_node_point(aes(color = group), size = 9) +
+  ggraph::geom_node_text(aes(label = name), repel = F, size = 1.8) +
+  scale_edge_color_gradient2(low =  "red",mid="white", high = "blue", midpoint = 0,name="partial correlation") +
+  scale_edge_width(range = c(0.2, 2),name="abs(partial correlation)") + theme_graph() + scale_color_manual(values=c("#DEDEDE","#AE7CCF")) 
+
+graph
+```
+

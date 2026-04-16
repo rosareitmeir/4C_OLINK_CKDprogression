@@ -1,0 +1,169 @@
+---
+title: "LASSO Regression"
+output: html_notebook
+---
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tibble)
+library(metadeconfoundR)
+library(ggpubr)
+library(readxl)
+library(paletteer)
+library(stringr)
+library(glmnet)
+library(mlr)
+```
+
+## Data Input
+```{r message=FALSE, warning=FALSE}
+### baseline table: contains all clinical variables at month 0 for each patient 
+BL_data_bpoffice <-read.csv2("~/Documents/4CStudy/Tables/BL_data_bpoffice.tsv",  sep = "\t",header=T)
+
+### investigation file from ckd progression, clinical data from all visits month 0 -120 
+investigation_file <-read.csv2("~/Documents/4CStudy/Tables/investigation_file.tsv",  sep = "\t",header=T) %>% filter(!is.na(month) & month!="FALSE")
+
+### from ckd progression 
+# contains the first month where the patient reached one of the endpoints: ckd50%, tx, dialysis
+reached_endpoint <- read.csv("~/Documents/4CStudy/Tables/reached_endpoint.csv", sep = ",", header=T) 
+
+### olink data
+olink_data <- read.csv2("~/Documents/4CStudy/Tables/OLINK_data.tsv",  sep = "\t",header=T) %>% arrange(pat_id) %>% rename(patid=pat_id) %>% mutate(across(everything(), as.numeric))
+
+
+pat_withoutegfr <- "xx"
+
+### labels 
+labels <- read_excel("C:/Users/rosa/Documents/4CStudy/ClinicalData/analyte_abbrev_HB.xlsx") 
+```
+
+
+## data preparation
+
+
+defining predictor categories
+- demographics: age,sex bmi
+- ckd related: ckd stage, alburie, eGFR
+- diagnosis
+- bloodpressure variables: systolic, diastolic, hypertension category (yes/no, treated/untreated)
+- site: country of center
+```{r}
+demographic_variables <- c("age", "sex",  "bmisds")
+ckd_variables <- c("egfr", "ckd1" , "alburie")
+site_variables <- c("country","center") ## center -> overfitting
+diagnose_variables <- c("diagnose2")
+bloodpressure_variables<- c("syssds","diasds","syssds_above2","diasds_above2", "hyper_class", "hyper_treat_group")
+
+variables <- c(demographic_variables, ckd_variables,site_variables,diagnose_variables,  bloodpressure_variables)
+
+### variable fit 
+## filter out without egfr and ckd (n=10) and hypertension group and olink sample
+patid_withckd1_hyper <- BL_data_bpoffice%>% filter(patid %in% olink_data$patid & !is.na(ckd1) & !is.na(hyper_treat_group)) %>% pull(patid)
+## make dummys from categories (hyper/bp group and class, sex,...)
+BL_data_bpoffice_imputed <- BL_data_bpoffice%>% filter(patid %in% patid_withckd1_hyper) %>% arrange(patid)%>% dplyr::select(patid, variables) %>% fastDummies::dummy_cols()
+
+## impute sys and dia with median, and other missing values
+BL_data_bpoffice_imputed<- impute(BL_data_bpoffice_imputed %>% dplyr::select(where(is.numeric)), classes=list(numeric=imputeMedian()))$data
+```
+
+### Run Lasso 
+
+```{r}
+## partially taken the code from  https://doi.org/10.1038/s41591-022-02014-8
+
+run_lasso<- function(data, predictors, start,end){
+  set.seed(100)
+  res <- data.frame(matrix(ncol=4,nrow=0))
+  j<-1
+  for( i in start:end){
+    y <- data.matrix(data[,i])
+    analyte<- names(data)[i]
+    ## first cross-fold validation, to find best lambda
+    cv.model <- cv.glmnet(predictors, y, alpha=1, nfolds=10, type.measure = "mse")
+    
+    best_lambda <- cv.model$lambda.min
+    
+    # fit model with best lambda
+    best_model <- glmnet(predictors, y, alpha = 1, lambda = best_lambda)
+    
+    # taken from publication https://doi.org/10.1038/s41591-022-02014-8:
+    if(length(which(as.vector(coef(cv.model, s='lambda.min'))!=0))==1){
+          fit=c(analyte, "0","0","1")
+        }else{
+          selected<-which(as.vector(coef(cv.model, s='lambda.min'))!=0)[-1]-1
+      
+          selected_predictors=as.data.frame(predictors[,selected])
+          selected_predictors$analyte <- as.vector(data.matrix(data[,i]))
+          # build model with the best selected predictors
+          fit=summary(lm(analyte~.,selected_predictors))
+        
+          # taken from publication:
+          # save adjusted r-square for this model
+          fit=c(analyte,ncol(selected_predictors)-1,fit$adj.r.squared,
+                pf(fit$fstatistic[1],fit$fstatistic[2],fit$fstatistic[3],lower.tail = F))
+        }
+    res[j,]<- fit
+    j <- j+1
+  }
+  
+  names(res) <- c("analyte", "num_predictors", "adjRsqr", "p_val")
+  return(res)
+}
+```
+
+
+run each lasso on set of predictors (demographics, bp, ckd,...)
+```{r}
+# subset to patients with available ckd and hypertension information 
+olink_input_lasso <- olink_data%>% filter(patid %in% patid_withckd1_hyper) %>% arrange(patid)
+
+############ demo
+lasso_analyte_res_demo <- run_lasso(data = olink_input_lasso,   
+                                  predictors =   data.matrix(BL_data_bpoffice_imputed %>% dplyr::select(starts_with("sex"), age,bmisds)), 82,158)
+
+############### bp 
+lasso_analyte_res_bp <- run_lasso(data = olink_input_lasso,
+                             predictors=  data.matrix(BL_data_bpoffice_imputed %>% dplyr::select(syssds,diasds,syssds_above2,diasds_above2, starts_with("hyper"))), 82,158)
+
+
+############# ckd
+lasso_analyte_res_ckd <- run_lasso(data = olink_input_lasso, 
+                                  predictors =  data.matrix(BL_data_bpoffice_imputed %>% dplyr::select(egfr, starts_with("ckd"), alburie)), 82,158)
+
+######## site/country
+lasso_analyte_res_country <- run_lasso(data = olink_input_lasso, 
+                                  predictors =  data.matrix(BL_data_bpoffice_imputed %>% dplyr::select( starts_with("country"))), 82,158)
+
+
+######## diagnose
+lasso_analyte_res_diagnose <- run_lasso(data = olink_input_lasso, 
+                                  predictors =  data.matrix(BL_data_bpoffice_imputed %>% dplyr::select( starts_with("diagnose2"))), 82,158)
+
+```
+
+
+put the result alltogether, run fdr correction 
+```{r}
+significant_variation_expl <- lasso_analyte_res_demo %>% mutate(class="demo")   %>% 
+  rbind(lasso_analyte_res_ckd %>% mutate(class="ckd")) %>% 
+  rbind(lasso_analyte_res_bp%>% mutate(class="bp")) %>% 
+ rbind(lasso_analyte_res_site %>% mutate(class="center")) %>% 
+  rbind(lasso_analyte_res_country %>% mutate(class="country")) %>%
+  rbind(lasso_analyte_res_diagnose %>% mutate(class="diagnose")) %>% 
+  mutate(p_val=as.numeric(p_val), adjRsqr=as.numeric(adjRsqr), analyte=str_replace(analyte,"^rawscale_",""))  %>% mutate(class=factor(class,levels=rev(c( "center","country","diagnose","bp", "demo","ckd"))))
+```
+
+#### Visualization
+visuliaze the variance explained for each predictor class , only with FDR-survived models
+```{r}
+library(paletteer)
+
+significant_variation_expl %>% mutate(fdr= p.adjust(p_val,method="fdr")) %>% filter(fdr <0.05) %>% left_join( labels, by="analyte") %>% 
+  ggplot(aes(x=reorder(name,-adjRsqr, FUN = sum), y=adjRsqr, fill=class )) +
+  geom_bar(position="stack", stat="identity") + theme_classic()+
+  ylab("adj. R²") + xlab("") + 
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  scale_fill_paletteer_d("LaCroixColoR::MelonPomelo", name="category")
+```

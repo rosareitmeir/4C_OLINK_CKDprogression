@@ -1,0 +1,205 @@
+---
+title: "metadeconfoundR"
+output: html_notebook
+---
+assocation of olink proteins and clinical variables
+
+```{r include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(paletteer)
+library(stringr)
+library(tibble)
+```
+
+## Data 
+```{r}
+pat_withoutegfr <- 737
+
+### baseline table: contains all clinical variables at month 0 for each patient 
+BL_data_bpoffice <-read.csv2("~/Projects/4cstudy/Tables/BL_data_bpoffice.csv",  sep = ",",header=T) %>% filter(patid != pat_withoutegfr) %>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))
+
+### investigation file from ckd progression, clinical data from all visits month 0 -120 
+investigation_file <-read.csv("~/Projects/4cstudy/Tables/investigation_file.csv",  sep = ",",header=T) %>% filter(!is.na(month) & month!="FALSE")%>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE))) 
+
+### from ckd progression 
+# contains the first month where the patient reached one of the endpoints: ckd50%, tx, dialysis
+reached_endpoint <- reached_endpoint <- read.csv("~/Projects/4cstudy/Tables/reached_endpoint.csv", sep = ",", header=T) %>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))
+
+
+### olink data
+
+olink_data <- read.csv("~/Projects/4cstudy/Tables/OLINK_data.csv",  sep = ",",header=T) %>% rename(patid=pat_id) %>%arrange(patid) %>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE))) %>% filter(patid != 737)
+
+### labels 
+labels <- read_excel("~/Projects/4cstudy/ClinicalData/analyte_abbrev_HB.xlsx") 
+```
+
+
+## Iteration Function 
+function that run all xx month endpoints
+each run looks for the assocation of reachinf the endpoint within xx months and the clinical variables of interest 
+
+the function defines reaching endpoint 
+prepares the data input for metadeconfoundR 
+runds metadeconfoundr and save output table and heatmap of the detected associations 
+```{r}
+run_metadeconfoundR_reachep <- function(m, metadata, olinkdata, reachedepdata, protein_prefix="rawscale_", path="C:/Users/rosa/Documents/4CStudy/Plots/mdcR2/", pat_withoutegfr=xxx,  qcutoff=0.05, metanames=NULL){
+
+## include either patients that reachednpoint at month xx or that have an entry at month xx
+## hence exclude patients that drop out in between, not counting as survivor
+### define reached endpoint within xx months 
+epname <- paste0("reachedep", m,"m")
+patient_reachep<- reachedepdata %>% filter(month <= m) %>% pull(patid) 
+
+## get patients that have an entry for month xx  
+pat_with_visit <- investigation_file  %>% filter(month== as.numeric(m)) %>% distinct(patid) %>% pull(patid)
+
+
+####################### protein data , subset to patients with data at month xx
+olink_input_metadecon <- olinkdata %>% filter(patid != pat_withoutegfr & (patid %in% pat_with_visit  | patid %in% patient_reachep))  %>% arrange(patid) %>% column_to_rownames("patid") %>% select(starts_with(protein_prefix))  %>% mutate(across(everything(), as.numeric))%>%data.frame()
+
+names(olink_input_metadecon)<-str_replace(names(olink_input_metadecon),paste0("^",protein_prefix),"")
+
+#################### meta data
+## get all covariates
+## country, diagnose, hyper groups as dummies 
+meta_input_metadecon_reachedep <- metadata %>% filter(patid != pat_withoutegfr  & (patid %in% pat_with_visit  | patid %in% patient_reachep) )  %>% arrange(patid) %>% select( age,sex,bmisds,egfr,alburie,salb,bicar,hb,phos,diasds,syssds,syssds_above2,diasds_above2, hyper_class, hyper_treat_group,medigr_RAS.inhibitors, medigr_Immunsuppressiva,diagnose2, country, patid) %>% mutate(hyper_class=if_else(hyper_class=="yes",1,0), alburie=log(alburie +0.01)) %>%  mutate(sex_male=if_else(sex=="male",1,0),.keep = "unused", .before = 1 ) %>% 
+fastDummies::dummy_columns(. ,select_columns = c("diagnose2", "hyper_treat_group", "country"), remove_selected_columns = T) 
+
+## define reached enpoint
+meta_input_metadecon_reachedep <- meta_input_metadecon_reachedep %>% mutate(reachedep=if_else(patid %in% patient_reachep,1,0),.before=1)
+
+### add type of reached endpoint : so that survival is compared with each endpoint 
+ meta_input_metadecon_reachedep<-  meta_input_metadecon_reachedep %>% left_join(
+   reached_endpoint %>% fastDummies::dummy_columns(. ,select_columns = c( "RRT"), remove_selected_columns = T)%>%  
+     select(starts_with("RRT",ignore.case = F) ,patid), by="patid")  %>% mutate(across(starts_with("RRT"), ~ case_when(.x==0 ~NA, is.na(.x) ~ 0, T ~.x)))
+
+## remove this variable
+if ("hyper_treat_group_NA" %in% names(meta_input_metadecon_reachedep)){
+  meta_input_metadecon_reachedep <- select(meta_input_metadecon_reachedep, -hyper_treat_group_NA )
+}
+## transform to data frame with rownames
+meta_input_metadecon_reachedep<- meta_input_metadecon_reachedep %>% arrange(patid) %>% column_to_rownames("patid") %>% as.data.frame(.)
+
+## set them to numeric variables
+meta_input_metadecon_reachedep[,3:12] <- apply(meta_input_metadecon_reachedep[,3:12], 2,as.numeric)
+
+
+###################################################################################
+## run metadeconfoundR
+print(paste("running metadeconfoundR", "endpoint", m, "m"))
+print(paste(names(table(meta_input_metadecon_reachedep$reachedep)), table(meta_input_metadecon_reachedep$reachedep), sep=":", collapse = " "))
+
+
+metadecon_output_ep <- MetaDeconfound(
+  featureMat =olink_input_metadecon[rownames(olink_input_metadecon)%in%rownames(meta_input_metadecon_reachedep),],
+  metaMat = meta_input_metadecon_reachedep,
+  returnLong = TRUE,
+ logLevel = "ERROR",
+ deconfF=c("RRT_Tx","RRT_CKD50","RRT_Dialysis")
+)
+
+## pretty names for heatmap
+if (is.null(metanames) & ncol(meta_input_metadecon_reachedep)==39){
+  
+metanames <- data.frame(original=names(meta_input_metadecon_reachedep), new= c(paste0("reached EP ", m, "m"),"sex","age","BMI sds","eGFR","log(alburie +0.01)","albumin","bicarbonat","hemoglobin","phosphorus","dia. sds","sys. sds","sys. sds > 2","dia- sds > 2","hypertension","CAKUT","Glomerulopathies","postAKI/HUS","other disease","Tubint","HTN: treated,normal","HTN: treated,uncontrolled","HTN: untreated,normal","HTN:untreated,uncontrolled","RAS inhibitor","Immunsuppressiva", "Austria","France", "Germany","Italy", "other country", "Poland", "Serbia", "Turkey", "UK","EP:50%loss","EP:Death","EP:Dialysis","EP:Transplantation" ) )
+  
+}
+
+  
+## save outcome
+heatmap<- BuildHeatmap(metadecon_output_ep,q_cutoff=qcutoff, metaVariableNames = metanames, featureNames = labels, reOrder = "feat") + theme(axis.text.x = element_text(size=9),axis.text.y = element_text(size=8), plot.title = element_blank() ) + ylab("") + xlab("") + labs( y="",x="",title="", subtitle="FDR: < 0.001 = ***, < 0.01 = **, < 0.05 = *")
+
+#ggsave( paste0(path, "heatmap_reachedendpoint_n", nrow(meta_input_metadecon_reachedep),"_",m,"m.pdf"),heatmap, width=6,height=10) 
+
+
+#write.table(metadecon_output_ep, paste0(path, "metadeconfoundR_output_reachedendpoint_n", nrow(meta_input_metadecon_reachedep),"_",m,"m.tsv"), row.names=F, quote=F,na="NA", sep="\t")
+
+  
+print( paste("number of signif. proteins:" , nrow(metadecon_output_ep %>% filter(metaVariable== "reachedep" & Qs< 0.05 & status == "OK_sd" ) %>% mutate(metaVariable= epname) )))
+
+return(metadecon_output_ep  )
+}
+
+```
+
+## Excecute iteration
+
+run function in for loop , from month 12 to 96
+
+saving results
+```{r}
+metadecon_allresults <- data.frame()
+for (i in 1:8){
+  res <- run_metadeconfoundR_reachep(m=12*i, metadata = BL_data_bpoffice,reachedepdata=reached_endpoint, olinkdata = olink_data) %>% filter(metaVariable== "reachedep" ) %>% mutate(metaVariable= paste0("reachedep", 12*i,"m"))
+
+  metadecon_allresults <- rbind(metadecon_allresults, res)
+}
+```
+
+## Summary plot 
+summary heatmap, 
+taking the columns of each endpoint and adding the assocation with other clinical variables for the endpoint at 12 month
+```{r}
+res12m <- run_metadeconfoundR_reachep(m=12, reachedepdata=reached_endpoint,metadata = BL_data_bpoffice, olinkdata = olink_data)
+```
+
+```{r}
+order_mvs<- c(rev(paste0("reachedep", seq(12,96,12), "m")),as.character(unique(res12m$metaVariable)[-1]))
+
+metanames <- data.frame(original=order_mvs, new= c(rev(paste0("reached EP ", seq(12,96,12), "m")),"sex","age","BMI sds","eGFR","log(alburie +0.01)","albumin","bicarbonat","hemoglobin","phosphorus","dia. sds","sys. sds","sys. sds > 2","dia- sds > 2","hypertension","CAKUT","Glomerulopathies","postAKI/HUS","other disease","Tubint","HTN: treated,normal","HTN: treated,uncontrolled","HTN: untreated,normal","HTN:untreated,uncontrolled","RAS inhibitor","Immunsuppressiva", "Austria","France", "Germany","Italy", "other country", "Poland", "Serbia", "Turkey", "UK","EP:50%loss","EP:Dialysis","EP:Transplantation" ))
+
+metadecon_allresults <- metadecon_allresults %>% group_by(feature) %>% filter(any(Qs<0.1))
+
+metadeconR_heatmap_all_covariatesEP12<- BuildHeatmap(
+  bind_rows(metadecon_allresults , res12m %>% filter(metaVariable!="reachedep" & feature %in% metadecon_allresults$feature)) %>% mutate(metaVariable=factor(metaVariable, levels=order_mvs))
+             ,q_cutoff=0.05, metaVariableNames = metanames, featureNames = labels, reOrder = "feat") + theme(axis.text.x = element_text(size=6.5),axis.text.y = element_text(size=6.5), plot.title = element_blank() )  + labs( y="",x="",title="", subtitle="FDR: < 0.001 = ***, < 0.01 = **, < 0.05 = *")
+
+                        
+metadeconR_heatmap_all_covariatesEP12                      
+```
+
+```{r}
+metadecon_allresults  %>% filter(startsWith(status,"C: R"))
+```
+### combine with contrasts
+
+```{r}
+diagnose_contrasts <- read.table(file="~/Projects/4cstudy/Tables/diagnose_contrast_results.csv", sep = ",",header=T)
+country_contrasts <- read.table(file="~/Projects/4cstudy/Tables/country_contrast_results.csv", sep = ",",header=T) 
+
+diagnose_contrasts<- diagnose_contrasts %>% rename(feature=analyte, metaVariable=contrast,Ps=p.value, Ds=effect_size) %>% mutate(status=if_else(Ps<0.05,"OK_sd","NS"),Qs=Ps) %>% dplyr::select(feature,metaVariable,Ps,Qs,Ds,status)
+
+country_contrasts<- country_contrasts %>% rename(feature=analyte, metaVariable=contrast,Ps=p.value, Ds=effect_size) %>% mutate(status=if_else(Ps<0.05,"OK_sd","NS"),Qs=Ps) %>% dplyr::select(feature,metaVariable,Ps,Qs,Ds,status)
+```
+```{r}
+metadata_0m<- BL_data_bpoffice %>% filter(patid != pat_withoutegfr)  %>% arrange(patid) %>% select( age,sex,bmisds,egfr,alburie,salb,bicar,hb,phos,diasds,syssds,syssds_above2,diasds_above2, hyper_class, hyper_treat_group,medigr_RAS.inhibitors, medigr_Immunsuppressiva,diagnose2, country, patid) %>% mutate(hyper_class=if_else(hyper_class=="yes",1,0), alburie=log(alburie +0.01)) %>%  mutate(sex_male=if_else(sex=="male",1,0),.keep = "unused", .before = 1 ) %>% 
+fastDummies::dummy_columns(. ,select_columns = c("diagnose2", "hyper_treat_group", "country"), remove_selected_columns = T) 
+
+metadata_0m <- metadata_0m %>% arrange(patid) %>% column_to_rownames("patid")
+
+olink_0m <- olink_data %>% filter(patid != pat_withoutegfr)  %>% arrange(patid) %>% column_to_rownames("patid") %>% select(starts_with("rawscale"))  %>% mutate(across(everything(), as.numeric))%>%data.frame()
+
+names(olink_0m)<-str_remove(names(olink_0m),"rawscale_")
+
+res0m <- MetaDeconfound(
+  featureMat =olink_0m[rownames(olink_0m)%in%rownames(metadata_0m),],
+  metaMat = metadata_0m,
+  returnLong = TRUE,
+ logLevel = "ERROR"
+)
+```
+
+
+```{r}
+metanames <- data.frame(original=unique(res0m$metaVariable), new= c("sex (male)","age","BMI sds","eGFR","UACR","albumin","bicarbonat","hemoglobin","phosphorus","dia. sds","sys. sds","sys. sds > 2","dia. sds > 2","hypertension","RAS inhibitor","Immunsuppressiva","CAKUT","Glomerulopathies","postAKI/HUS","other disease","Tubint","HTN: treated,normal","HTN: treated,uncontrolled","HTN: untreated,normal","HTN:untreated,uncontrolled","HTN:NA","Austria","France", "Germany","Italy", "other country", "Poland", "Serbia", "Turkey", "UK" )) %>% rbind(data.frame(original=unique(diagnose_contrasts$metaVariable),new=unique(diagnose_contrasts$metaVariable))) %>%
+  rbind(data.frame(original=unique(country_contrasts$metaVariable),new=unique(country_contrasts$metaVariable)))
+
+BuildHeatmap(res0m %>% mutate(Ds=scale(Ds))%>% filter(! startsWith(as.character(metaVariable),"country") & (!startsWith(as.character(metaVariable),"diagnose")) ) %>% rbind(diagnose_contrasts) %>% rbind(country_contrasts) , 
+              metaVariableNames = metanames, featureNames = labels,
+             reOrder="feat",q_cutoff = 0.05 ) +labs( y="",x="",title="", subtitle="FDR/Tukey p-val: < 0.001 = ***, < 0.01 = **, < 0.05 = *")
+```
+

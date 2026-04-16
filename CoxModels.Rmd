@@ -1,0 +1,465 @@
+---
+title: "Cox Regression"
+output:
+  html_document:
+    df_print: paged
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+includes the cox models with stratification for ckd and age and the HR plot for the CKD/UACR subgroups 
+
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(paletteer)
+library(tibble)
+library(mlr)
+library(stringr)
+library(survival)
+library(purrr)
+library(ggpubr)
+library(survminer)
+library(broom)
+library(gridExtra)
+library(viridisLite)
+library(ggstats)
+library(matrixStats)
+library(ggrepel)
+```
+
+## 0 Functions
+```{r include=FALSE}
+extract_cox_results <- function(coxmodel){
+  summary_cox <- summary(coxmodel)
+hr <- exp(coef(coxmodel))  # HR = exp(beta)
+ci <- exp(confint(coxmodel))  # 95% CI for HR
+p_vals <- summary_cox$coefficients[, "Pr(>|z|)"]
+p.adjusted <- p.adjust(p_vals, method = "BH")
+
+# Create a data frame
+results <- data.frame(
+  Variable = names(hr),
+  HR = hr,
+  CI_lower = ci[, 1],
+  CI_upper = ci[, 2],
+  p_value = p_vals,
+  p_adj=p.adjusted
+)
+results$p_label <- ifelse(results$p_value < 0.001, "<0.001", sprintf("%.3f", results$p_value))
+results <-results %>% mutate( significant=(p_value <0.05), Variable=factor(Variable,levels=rev(rownames(results))))
+
+return(results)
+}
+
+
+
+plot_HR_forest <- function(coxmodel,labels){
+
+results <- extract_cox_results(coxmodel)
+
+plot<- ggplot(results, aes(x = Variable, y = HR)) + 
+  
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2, color = "black") +  # Error bars for CI
+   geom_point(size = 3, color = "blue", aes(alpha=significant)) + 
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +  # Reference line at HR = 1
+  coord_flip() +  # Flip to horizontal
+   geom_text(aes(label = paste0("p = ", p_label), x = Variable, y = max(CI_upper) + 0.15),  # Adjust position
+            hjust = 0, size = 3, color = "black")+
+  theme_classic() + scale_alpha_manual(values=c(0.4,1))+ 
+  labs(x="" , y = "Hazard Ratio (HR)") + scale_x_discrete(labels=labels)+
+  theme(axis.text = element_text(size = 10), legend.position = "none") 
+
+return(plot)
+}
+```
+
+## 1 Data
+
+survival data: with survival time (time in years from study entrance
+till endpoint is reached or study left) reachep: composite endpoint
+including 50% eGFR loss, Transplantation or Dialysis
+
+data was generated in SurvivalAnalysis_Preparation
+```{r}
+### defined inflammation score with a cutoff of 80th, based on egfr and proteinuria -> 660 patients 
+coxdata_with_iscore <-  read.csv("~/Projects/4cstudy/Tables/survival_data.csv",  sep = ",",header=T)
+
+## 5p , 80 cutoff
+coxdata_with_iscore <- coxdata_with_iscore %>% mutate(i_score_5p_80= high_80_residual_pd_l1 + high_80_residual_cd40+high_80_residual_tnfrsf9+high_80_residual_cx3cl1+high_80_residual_il_15ra )
+
+## 5p 50 cutoff
+coxdata_with_iscore <- coxdata_with_iscore %>% mutate(i_score_5p_50=high_50_residual_pd_l1 + high_50_residual_cd40+high_50_residual_tnfrsf9+high_50_residual_cx3cl1+high_50_residual_il_15ra )
+```
+```{r}
+## additional information about medication
+BL_data_bpoffice <-read.csv2("~/Projects/4cstudy/Tables/BL_data_bpoffice.csv",  sep = ",",header=T) %>% filter(patid != 737) %>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))
+```
+
+
+## 2 Cox Regression
+
+survival time: time from study entrance till endpoint is reached
+
+endpoint (reachep): 50% eGFR loss, dialysis or transplantation
+
+goal: create a good predictive cox model
+
+including inflammation score accounting for other factors and predictors
+of CKD progression
+
+-\> quite a lot of variables, proportional Hazard assumption?
+
+### 2.1 Straight-forward Model
+
+adding all relevant variables (based on literature and results of Random
+Survival Forest variable importance):
+
+-   eGFR
+
+-   proteinuria
+
+-   age at study entrance (BLage)
+
+-   underlying diseases (CAKUT,Glomerulonephritis,..), diagnose2
+
+-   sex
+
+-   hemoglobin (hb)
+
+-   blood phosphorus (phos)
+
+-   serum albumin (salb)
+
+-   our defined inflammation score : i-score
+
+```{r}
+formula <- as.formula("Surv(survival_time,reachep)~ egfr +log(alburie+0.01)+ BLage+ diagnose2+ sex  + log(salb)+diasds+ +i_score")
+
+coxmodel_simple <-  coxph(  formula=formula, 
+                              
+                          data= coxdata_with_iscore)
+cox.zph(coxmodel_simple)
+plot(cox.zph(coxmodel_simple))
+```
+
+in particular beta coefficient of eGFR seems to increase with time
+
+age fluctuates and alburie has as well a weird shape
+
+-\> trying strata to control for different effect of eGFR, proteinuria
+and age
+
+### 2.2 Stratified Model
+
+-   stratifying based on CKD stage (2,3a,3b,4,5), ckd1
+
+-   based on age: younger than 12 (median) or older than 12
+
+-   and strata for proteinuria in (A1: \<3),(A2: \>3 & \< 30) ,(A3:
+    \>30)
+
+-   -\> different baseline hazard function depending on kidney function
+    at study entrance (eGFR and proteinuria) and age
+
+#### Strata Investigation
+
+```{r}
+coxdata_with_iscore<-coxdata_with_iscore %>% mutate( age2= if_else(BLage <= 12.205,"young","old"), 
+                                                     acr_grp= case_when(alburie< 30 ~"A1", alburie>300~"A3",T~"A2") )
+
+ckd2stage_pats <- coxdata_with_iscore %>% filter(egfr>60) %>% pull(patid)
+```
+
+risk of overfitting?
+
+as strata of the three variables: ckd stage, proteinuria and age results
+in a lot of small strata
+
+```{r}
+coxdata_with_iscore %>% mutate(strata=paste(age2,ckd1,acr_grp,sep=",")) %>% dplyr::count(strata) %>% arrange(n)
+```
+
+not stratifying by proteinuria?
+
+```{r}
+coxdata_with_iscore %>% mutate(strata=paste(age2,ckd1,sep=",")) %>% dplyr::count(strata) %>% arrange(n)
+
+```
+
+kaplan meier curves for the strata
+
+```{r}
+ggsurvplot(surv_fit( as.formula("Surv( survival_time,reachep)~ strata"), 
+                     data= coxdata_with_iscore %>% filter(!patid %in% ckd2stage_pats) %>% mutate(strata=paste(age2,ckd1,sep=","))), 
+           risk.table=T, ggtheme=theme_classic(), palette = c( "#FCAADEFF","#EF5FAFFF","#C31E6EFF","#7F0038FF", "#99CE64FF", "#659A32FF", "#326812FF", "#033800FF"))
+```
+
+clearly different curves for the ckd stages and also in some ckd stages
+differences in age, in particular stage 4
+
+#### final strata model
+
+fitting it without ckd stage 2 , not enough patients (n=8) for having
+their own strata
+
+```{r}
+formula <- as.formula("Surv(survival_time,reachep)~egfr +BLage+ sex+ log(alburie+0.01)+ diagnose2+log(salb)+ phos+diasds+i_score+ survival::strata(ckd1,age2)")
+
+coxmodel_withstrata <-  coxph(  formula=formula, 
+                              
+                          data= coxdata_with_iscore %>% filter(!patid %in% ckd2stage_pats))
+
+
+cox.zph(coxmodel_withstrata)
+plot(cox.zph(coxmodel_withstrata))
+```
+
+improved schonefeld plots for all variables
+
+age looks quite flat now and also improvement in eGFR and other variables
+
+
+```{r warning=FALSE}
+AIC(coxmodel_simple,coxmodel_withstrata)
+```
+
+```{r}
+names(coxmodel_withstrata$coefficients)
+labels <- c("egfr"="eGFR","BLage"="age at BL", "sexmale"="sex", "log(alburie + 0.01)"="log(alburie + 0.01)",
+            "diagnose2Glomerulopathies"="glomerulopathies","diagnose2Nephloss"="postAKI/HUS",
+            "diagnose2Other"="other diagnose", "diagnose2Tubint"="Tubint","log(salb)"="log(salb)", "hb"="hemoglobin","phos"="phosphorus", "diasds"="dia. SDS", "i_score"= "i-score")
+
+plot_HR_forest(coxmodel_withstrata,labels=labels) + ylim(0.12,3.6)
+```
+#### additive approach
+```{r}
+########## only i-score
+formula <- as.formula("Surv(survival_time,reachep)~i_score+ survival::strata(ckd1,age2)")
+
+coxmodel_only_iscore <-  extract_cox_results( coxph(  formula=formula, data= coxdata_with_iscore %>% filter(!patid %in% ckd2stage_pats))) %>% mutate(model="only i-score")
+
+######### i-score + KFRE
+formula <- as.formula("Surv(survival_time,reachep)~i_score+ egfr +BLage+ sex+ log(alburie+0.01)+ survival::strata(ckd1,age2)")
+
+coxmodel_iscore_KFRE <-   extract_cox_results(coxph(  formula=formula, data= coxdata_with_iscore %>% filter(!patid %in% ckd2stage_pats))) %>% mutate(model="KFRE")
+
+######### i-score + phos + salb
+formula <- as.formula("Surv(survival_time,reachep)~i_score+ +log(salb)+ phos + survival::strata(ckd1,age2)")
+
+coxmodel_iscore_blood <-  extract_cox_results( coxph(  formula=formula, data= coxdata_with_iscore %>% filter(!patid %in% ckd2stage_pats)))%>%
+  mutate(model="blood")
+
+
+######### i-score + all + RAS
+formula <- as.formula("Surv(survival_time,reachep)~egfr +BLage+ sex+ log(alburie+0.01)+  diagnose2+log(salb)+  phos+diasds+ RAS+i_score+ survival::strata(ckd1,age2)")
+
+coxmodel_iscore_RAS <-  extract_cox_results( coxph(  formula=formula, data= coxdata_with_iscore %>% 
+                                                       left_join(BL_data_bpoffice %>% select(patid,RAS=medigr_RAS.inhibitors)) %>% 
+                                                       filter(!patid %in% ckd2stage_pats))) %>% mutate(model="RAS + all")
+
+allresults <- rbind(coxmodel_iscore_RAS,coxmodel_iscore_blood,coxmodel_iscore_KFRE ,coxmodel_only_iscore,
+                    extract_cox_results(coxmodel_withstrata) %>% mutate(model="all"))%>% mutate(model=factor(model, levels = rev(c("only i-score","KFRE","blood","all", "RAS + all"))))
+
+```
+
+```{r}
+p<- allresults %>% filter(Variable=="i_score" & model!="RAS + all") %>% 
+  ggplot(aes(x=model,y=HR)) + 
+    
+geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2, color = "black") +  # Error bars for CI
+   geom_point(size = 3, color = "blue", aes(alpha=significant)) + 
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +  # Reference line at HR = 1
+  coord_flip() +  # Flip to horizontal
+   geom_text(aes(label = paste0("p = ", p_label), x = model, y = max(CI_upper) + 0.02),  # Adjust position
+          hjust = 0, size = 3, color = "black")+
+  theme_classic() + scale_alpha_manual(values=c("FALSE"=0.4,"TRUE"=1))+ 
+  labs(x="" , y = "Hazard Ratio (HR)") + scale_x_discrete(labels=labels)+
+  theme(axis.text = element_text(size = 10), legend.position = "none") 
+
+p_supplement <- allresults %>% filter(Variable=="i_score" ) %>%
+  ggplot(aes(x=model,y=HR)) + 
+geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.2, color = "black") +  # Error bars for CI
+   geom_point(size = 3, color = "blue", aes(alpha=significant)) + 
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red") +  # Reference line at HR = 1
+  coord_flip() +  # Flip to horizontal
+   geom_text(aes(label = paste0("p = ", p_label), x = model, y = max(CI_upper) + 0.02),  # Adjust position
+          hjust = 0, size = 3, color = "black")+
+  theme_classic() + scale_alpha_manual(values=c("FALSE"=0.4,"TRUE"=1))+ 
+  labs(x="" , y = "Hazard Ratio (HR)") + scale_x_discrete(labels=labels)+
+  theme(axis.text = element_text(size = 10), legend.position = "none") 
+
+```
+
+
+
+
+### other i-scores
+
+#####  4p , cut off 80, category
+```{r}
+## 4p , cut off 80, categrocial
+formula_i80_cat<- as.formula("Surv(survival_time,reachep)~egfr +BLage+ sex+ log(alburie+0.01)+  diagnose2+log(salb)+diasds+ +hb+phos+i_score_80_cat + survival::strata(ckd1,age2)")
+
+coxmodel_withstrata_i80_cat <-  coxph(  formula=formula_i80_cat, 
+                              
+                          data= coxdata_with_iscore %>% mutate(i_score_80_cat=case_when(i_score_80==0~"0", i_score_80>0 & i_score_80<=1 ~"1", T~"2-4")) %>% filter(!patid %in% ckd2stage_pats))
+
+plot_HR_forest(coxmodel_withstrata_i80_cat,labels=labels) + ylim(0.2,3.6)
+```
+
+
+```{r}
+## 4p , pseudo continous
+formula_i80_cat<- as.formula("Surv(survival_time,reachep)~egfr +BLage+ sex+ log(alburie+0.01)+  diagnose2+log(salb)+diasds+ +hb+phos+i_score_80_cat + survival::strata(ckd1,age2)")
+
+coxmodel_withstrata_i80_cat <-  coxph(  formula=formula_i80_cat, 
+                              
+                          data= coxdata_with_iscore %>% mutate(i_score_80_cat=case_when(i_score_80==0~0, i_score_80>0 & i_score_80<=2 ~1, T~2)) %>% filter(!patid %in% ckd2stage_pats))
+
+plot_HR_forest(coxmodel_withstrata_i80_cat,labels=labels) + ylim(0.2,3.6)
+```
+
+#####  4p , cut off 50
+```{r}
+## 4p , cut off 50
+formula_i50 <- as.formula("Surv(survival_time,reachep)~egfr +BLage+ sex+ log(alburie+0.01)+  diagnose2+log(salb)+diasds+ +hb+phos+i_score_50 + survival::strata(ckd1,age2)")
+
+coxmodel_withstrata_i50 <-  coxph(  formula=formula_i50, 
+                              
+                          data= coxdata_with_iscore %>% filter(!patid %in% ckd2stage_pats))
+plot_HR_forest(coxmodel_withstrata_i50,labels=labels) + ylim(0.2,3.6)
+
+```
+
+##### 5p , cut off 80
+```{r}
+## 5p , cut off 80
+formula_5p_i80 <- as.formula("Surv(survival_time,reachep)~egfr +BLage+ sex+ log(alburie+0.01)+  diagnose2+log(salb)+diasds+ +hb+phos+i_score_5p_80 + survival::strata(ckd1,age2)")
+
+coxmodel_withstrata_5p_i80 <-  coxph(  formula=formula_5p_i80, 
+                              
+                          data= coxdata_with_iscore %>% filter(!patid %in% ckd2stage_pats))
+plot_HR_forest(coxmodel_withstrata_5p_i80,labels=labels) + ylim(0.2,3.6)
+```
+
+## 3 Plot Stratification
+visualizing hazard ratio of i-score for each ckd stage and albuminuria group
+solely plotting, for some ckd stage not enough sample size, too uncertain, great range of CIs
+
+```{r}
+## simple cox model for each subset (ckd and acr)
+get_hazardratio <- function(df,iscore="i_score_50"){
+
+form_text <- paste0("Surv( survival_time,reachep)~  BLage +sex + egfr + log(alburie +0.01) + strata(age2)+", iscore)
+  
+cox_model<- coxph(as.formula(form_text), data=df )
+cox_sum<- summary(cox_model)
+
+hr <- coef(cox_sum)[iscore, "exp(coef)"]
+p_value <-cox_sum$coefficients[iscore, "Pr(>|z|)"]
+ci_low <- exp(confint(cox_model))[iscore, 1]
+ci_up<- exp(confint(cox_model))[iscore, 2]
+size<- cox_model[["n"]]
+
+return(data.frame( hr=hr,p_val=p_value,CI_low=ci_low,CI_up=ci_up,n=size))
+}
+```
+
+```{r}
+allstages_cueniform_hr <- list()
+
+for (stage in rev(unique(coxdata_with_iscore$ckd1))){
+  for(alb_grp in rev(unique(coxdata_with_iscore$acr_grp))){
+    
+    
+    data<- coxdata_with_iscore %>% filter(ckd1==stage & acr_grp==alb_grp)
+  
+    if(nrow(data)>5){
+    hrs <- get_hazardratio(df=data ,iscore="i_score_80") %>%  
+      mutate(ckdstage=stage,alb_grp=alb_grp)
+    }
+    else{
+     hrs<- data.frame(hr=NA,p_val=NA,CI_low=NA,CI_up=NA,n=nrow(data),ckdstage=stage,alb_grp=alb_grp)
+    }
+  
+
+  allstages_cueniform_hr[[paste0(stage,":",alb_grp )]]<- hrs
+  
+  
+  }}
+
+hr_cueniform_data<- bind_rows(allstages_cueniform_hr)
+
+
+hr_cueniform_data %>% filter(n>10)
+```
+
+```{r}
+plot_cueninform <- function(data){
+maxhr <- max(data %>% filter(!is.infinite(CI_up)&CI_up <100000 & !is.na(hr)) %>% pull(hr))
+minhr <- min(data %>% filter( !is.infinite(CI_up)& CI_up <100000 & !is.na(hr)) %>% pull(hr))
+
+print(minhr)
+if (minhr > 1){
+  cols <- c("#BB292CFF", "#FFD353FF")
+  vals<-  scales::rescale(c(maxhr+0.3, minhr),
+                        limits = c(minhr,maxhr+0.3))
+  brks<- c(minhr,(minhr+ maxhr)/2,maxhr, maxhr + 0.3)
+  lbls<-c(sprintf("%.1f", minhr), sprintf("%.1f", (minhr+ maxhr)/2), sprintf("%.1f", maxhr), paste0("> ",round(maxhr,1)))
+}
+else{
+  cols<- c("#BB292CFF", "#FFD353FF", "#72874EFF", "#466532FF")
+  vals <-  scales::rescale(c(maxhr+0.3, 1,0.99, minhr),
+                        limits = c(minhr,maxhr+0.1))
+  brks<- c(minhr,1,(1+ maxhr)/2, maxhr,maxhr+0.3)
+  lbls<- c(sprintf("%.1f", minhr), "1",sprintf("%.1f", (1+ maxhr)/2), sprintf("%.1f", maxhr), paste0("> ",round(maxhr,1)))
+   # lbls<- c(sprintf("%.1f", minhr),"1",sprintf("%.1f", (1+ maxhr)/2), sprintf("%.1f", maxhr))
+}
+
+### breaks for sample size
+sizebreaks <- c(min(data %>% pull(n)),median(data %>% pull(n)),100,max(data %>% pull(n)))
+
+plot<-  ggplot(data %>% filter( !is.na(hr)) %>% mutate( direction=if_else(hr>1,"HR>1","HR<1"), hr= if_else(is.infinite(CI_up)| CI_up >100000,maxhr+0.3,hr), ckdstage= factor(ckdstage, levels=unique(coxdata_with_iscore$ckd1))), aes(x = alb_grp, y = ckdstage)) +
+  geom_point(aes(
+    color = hr ,
+    fill=hr,
+    shape = direction,  ),size=4 ,stroke = 0.9) +
+  geom_text_repel(aes(label=n),min.segment.length="",vjust=2.5,size=3)+
+  scale_shape_manual(values = c("HR<1"=25,"HR>1"=24),name="") +  # 25 (downward triangle), 24 (upward triangle)
+   scale_fill_gradientn(colors = cols, 
+                        values =vals,
+                        breaks = brks,  # Custom ticks
+                        labels = lbls # Custom labels
+  ) + 
+    scale_color_gradientn(colors = cols, 
+                        values = vals) + 
+  
+ scale_x_discrete(position = "top")+
+  theme_minimal() + scale_size_continuous(breaks = sizebreaks)+
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()  )+
+  labs(
+    title = "",
+    x = "Albuminuria Group",
+    y = "CKD stage",
+    fill = "Magnitude of HR",
+    shape= "HR >1",
+    size = "Sample Size"
+  ) + geom_stripped_rows() +guides(colour = "none")
+ 
+
+ return(plot)
+}
+```
+
+
+```{r}
+plot_cueninform(hr_cueniform_data %>% filter(n>10 )) 
+ggsave(paste0("~/Projects/4cstudy/Plots/SurvivalAnalysis/Figure4/HRcueniform_stratification_4p_i80_number_samplesize.pdf"),plot_cueninform(hr_cueniform_data %>% filter(n>10 )), width=6.8,height=4.9)
+```

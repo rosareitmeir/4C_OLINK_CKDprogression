@@ -1,0 +1,531 @@
+---
+title: "Linear Models & Contrasts"
+output: html_notebook
+---
+
+This script contains the analysis and plot of figure 2:
+
+linear models of eGFR/UACR for the different OLINK proteins as well as contrast test for investigating the influence of patient's origin (country) and diseases
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(tibble)
+library(metadeconfoundR)
+library(ggpubr)
+library(readxl)
+library(paletteer)
+library(stringr)
+library(glmnet)
+library(mlr)
+theme_classic_modified <- function(){
+  theme_classic() %+replace%
+    theme(strip.placement="outside", 
+                           strip.text.y.left = element_text(angle = 0,size=11),
+                           strip.background.y=element_rect(color = NA), 
+                           strip.background.x=element_rect(color = NA),
+                           legend.position = "none") 
+}
+```
+analysis showing in figure 2 
+associations between eGFR and other clinical variables at study entrance to olink protein profile
+## Data Input
+```{r message=FALSE, warning=FALSE}
+pat_withoutegfr <- xxx
+
+### baseline table: contains all clinical variables at month 0 for each patient 
+BL_data_bpoffice <-read.csv2("~/Projects/4cstudy/Tables/BL_data_bpoffice.csv",  sep = ",",header=T) %>% filter(patid != pat_withoutegfr) %>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))
+
+### investigation file from ckd progression, clinical data from all visits month 0 -120 
+investigation_file <-read.csv("~/Projects/4cstudy/Tables/investigation_file.csv",  sep = ",",header=T) %>% filter(!is.na(month) & month!="FALSE")%>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE))) 
+
+### from ckd progression 
+# contains the first month where the patient reached one of the endpoints: ckd50%, tx, dialysis
+reached_endpoint <- reached_endpoint <- read.csv("~/Projects/4cstudy/Tables/reached_endpoint.csv", sep = ",", header=T) %>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))
+
+
+### olink data
+
+olink_data <- read.csv("~/Projects/4cstudy/Tables/OLINK_data.csv",  sep = ",",header=T) %>% rename(patid=pat_id) %>%arrange(patid) %>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE))) %>% filter(patid != 737)
+
+### labels 
+labels <- read_excel("~/Projects/4cstudy/ClinicalData/analyte_abbrev_HB.xlsx") 
+```
+
+## Beta Coefficient Analysis
+
+### Function 
+running linear model with eGFR as main predictor, other predictors as adjustment possible
+scaling analyte yes or no 
+returns beta estimate and CI for eGFR as well as wald test p-value, and model fit (r-square)
+
+data: olink protein data frame
+predictors: data frame of explaintory variables of interest (egfr,diagnose,...)
+start, end : index of protein columns in the data frame 
+```{r}
+run_coefficent_egfr<- function(data, predictors, start,end, scale=T,mainpred="egfr"){
+  res <- list()
+  j<-1
+  ## build linear model for each protein 
+  for( i in start:end){
+    
+    y <- data.matrix(data[,i])
+    analyte<- names(data)[i]
+    ## build model 
+    if(scale){
+       lm=(lm(scale(analyte)~.,predictors %>% mutate(analyte=y)))
+    }
+    else{
+       lm=(lm(analyte~.,predictors %>% mutate(analyte=y)))
+    }
+   
+    fit = summary(lm)
+    
+    ## get confidence interval for eGFR coefficent
+    confint_egfr <- data.frame(confint(lm) )%>% tibble::rownames_to_column("predictor")
+   
+    confint_egfr <- confint_egfr%>% filter(predictor==!!(mainpred))
+    
+    # save results of lm 
+    df<- data.frame(analyte=analyte,
+                    adjRsqr=fit$adj.r.squared,
+                    p_valRsqr=pf(fit$fstatistic[1],fit$fstatistic[2],fit$fstatistic[3],lower.tail = F), pval=fit$coefficients[mainpred,4] ,
+                    estimate=fit$coefficients[mainpred,1], 
+                    down=confint_egfr[,2],up=confint_egfr[,3])
+
+    res[[j]]<- df
+    j <- j+1
+  }
+  
+  res <- bind_rows(res)
+  ## pval over all protein lms
+  res$FDR <-p.adjust(as.numeric(res$pval), method="fdr")
+  return(res)
+}
+```
+
+### Build eGFR Models
+
+three models:
+- only eGFR 
+- eGFR + "demographic variables": sex + age + bmisds + country
+- eGFR + diagnose
+
+for all models scaled npx-values for the proteins (making the beta coefficietnes more comparable)
+
+model 1: only egfr
+```{r}
+### only egfr
+  only_scaled_egfr_sa_lm_res <- run_coefficent_egfr(data = olink_data %>% filter(patid != pat_withoutegfr) %>% arrange(patid),  
+                                                    predictors =  BL_data_bpoffice %>%arrange(patid) %>% dplyr::select(egfr) , start=82,end=158) 
+
+only_scaled_egfr_sa_lm_res <-only_scaled_egfr_sa_lm_res %>%mutate( analyte=str_replace(analyte,"^rawscale_","")) %>% mutate(across(c(estimate,up,down), as.numeric)) 
+```
+
+model 2: egfr + demo
+adding predictors: sex, age, bmi, country 
+always scaling analytes
+
+transforming country and sex to dummy variables 
+```{r}
+### egfr + demographs + country  
+demo_egfr_sa_lm_res <- run_coefficent_egfr(data = olink_data %>% arrange(patid), 
+                                  predictors =  BL_data_bpoffice   %>% dplyr::select(egfr,age,bmisds,sex, starts_with("country")) %>% fastDummies::dummy_columns(. ,select_columns = c("country", "sex"),remove_selected_columns = T) %>% select(-sex_female), 82,158) %>%mutate( analyte=str_replace(analyte,"^rawscale_","")) 
+
+demo_egfr_sa_lm_res <- demo_egfr_sa_lm_res %>% mutate(across(c(estimate,up,down), as.numeric))
+```
+
+model 3: egfr + diagnose 
+
+adding diagnose to the model , also here transforming to mulitiple dummy variables
+```{r}
+### egfr +diagnose 
+diagnose_egfr_sa_lm_res <- run_coefficent_egfr(data = olink_data %>% arrange(patid), 
+                                  predictors =  BL_data_bpoffice   %>% dplyr::select(egfr, diagnose2)  %>% fastDummies::dummy_columns(. ,select_columns = c("diagnose2"),remove_selected_columns = T) , 82,158) %>%mutate( analyte=str_replace(analyte,"^rawscale_","")) 
+
+
+diagnose_egfr_sa_lm_res <- diagnose_egfr_sa_lm_res %>% mutate(across(c(estimate,up,down), as.numeric))
+```
+model 4: alburie
+
+```{r}
+### only alburie
+  only_alburie_sa_lm_res <- run_coefficent_egfr(data = olink_data %>% filter(patid != pat_withoutegfr) %>% arrange(patid),  
+                                                    predictors =  BL_data_bpoffice %>%arrange(patid) %>% mutate(alburie=-log(alburie+0.01)) %>%dplyr::select(alburie),mainpred = "alburie" , start=82,end=158) 
+
+only_alburie_sa_lm_res <-  only_alburie_sa_lm_res %>%mutate( analyte=str_replace(analyte,"^rawscale_","")) %>% mutate(across(c(estimate,up,down), as.numeric)) 
+```
+
+model 5: egfr + alburie
+
+```{r}
+### egfr+ alburie
+  egfr_alburie_sa_lm_res <- run_coefficent_egfr(data = olink_data %>% filter(patid != pat_withoutegfr) %>% arrange(patid),  
+                                                    predictors =  BL_data_bpoffice %>%arrange(patid) %>% mutate(alburie=-log(alburie+0.01)) %>%dplyr::select(alburie,egfr), start=82,end=158) 
+
+egfr_alburie_sa_lm_res <-  egfr_alburie_sa_lm_res %>%mutate( analyte=str_replace(analyte,"^rawscale_","")) %>% mutate(across(c(estimate,up,down), as.numeric)) 
+
+## estimates for alburie
+  alburie_egfr_sa_lm_res <- run_coefficent_egfr(data = olink_data %>% filter(patid != pat_withoutegfr) %>% arrange(patid),  
+                                                    predictors =  BL_data_bpoffice %>%arrange(patid) %>% mutate(alburie=-log(alburie+0.01)) %>%dplyr::select(alburie,egfr), start=82,end=158, mainpred = "alburie") 
+
+  alburie_egfr_sa_lm_res <-    alburie_egfr_sa_lm_res %>%mutate( analyte=str_replace(analyte,"^rawscale_","")) %>% mutate(across(c(estimate,up,down), as.numeric)) 
+```
+
+model 6: all 
+
+```{r}
+### egfr+ alburie
+  egfr_all_sa_lm_res <- run_coefficent_egfr(data = olink_data %>% filter(patid != pat_withoutegfr) %>% arrange(patid),   predictors =  BL_data_bpoffice   %>% dplyr::select(egfr,alburie,age,bmisds,sex,diagnose2, starts_with("country")) %>% fastDummies::dummy_columns(. ,select_columns = c("country","diagnose2", "sex"),remove_selected_columns = T) %>% mutate(alburie=-log(alburie+0.01)) %>% select(-sex_female), start=82,end=158) 
+
+  egfr_all_sa_lm_res <-   egfr_all_sa_lm_res %>%mutate( analyte=str_replace(analyte,"^rawscale_","")) %>% mutate(across(c(estimate,up,down), as.numeric)) 
+
+## estimates for alburie
+  alburie_all_sa_lm_res <- run_coefficent_egfr(data = olink_data %>% filter(patid != pat_withoutegfr) %>% arrange(patid),   predictors =  BL_data_bpoffice   %>% dplyr::select(egfr,alburie,age,bmisds,sex, starts_with("country"),diagnose2) %>% fastDummies::dummy_columns(. ,select_columns = c("country", "sex","diagnose2"),remove_selected_columns = T) %>% mutate(alburie=-log(alburie+0.01)) %>% select(-sex_female), start=82,end=158,mainpred = "alburie") 
+  
+  alburie_all_sa_lm_res <-     alburie_all_sa_lm_res %>%mutate( analyte=str_replace(analyte,"^rawscale_","")) %>% mutate(across(c(estimate,up,down), as.numeric)) 
+```
+
+### Visualize Beta Coef Plot
+figure 2 plot
+
+pretty names for the proteins
+```{r}
+labels <- setNames( labels$name,labels$analyte)
+```
+
+#### egfr + UACR coef
+```{r}
+## bind results of all three models
+allresults <-  
+  ## all model, coef for egfr
+  egfr_all_sa_lm_res  %>% mutate(model="full",var="eGFR")   %>% 
+   ## all model, coef for alburie
+   rbind(.,alburie_all_sa_lm_res %>% mutate(model="full", var="UACR")) %>%
+  ## only egfr
+  rbind(.,only_scaled_egfr_sa_lm_res %>% mutate(model="eGFR", var="eGFR")) %>%
+  ## only alburie
+  rbind(.,only_alburie_sa_lm_res %>% mutate(model="UACR", var="UACR")) %>%
+  ## egfr + alburie: egfr beta coef
+   rbind(.,egfr_alburie_sa_lm_res %>% mutate(model="eGFR + UACR",var="eGFR")) %>%
+  rbind(.,alburie_egfr_sa_lm_res %>% mutate(model="eGFR + UACR",var="UACR")) %>% 
+  ## filter for FDR 
+  group_by(analyte)%>%  filter(any(FDR < 0.05)) %>% mutate(significant=FDR<0.05) %>%
+  ## naming models for plot
+  mutate(model=factor(model, level=c( "eGFR","UACR","eGFR + UACR", "full"))) 
+
+analyte_estimate_size <- allresults %>% filter(var=="eGFR") %>% group_by(analyte) %>% slice_max(abs(estimate)) %>% ungroup()%>% arrange(-estimate) %>% pull(analyte)
+```
+
+#### figure 2 plot
+```{r}
+ allresults %>% mutate(analyte=factor(analyte, level=analyte_estimate_size))%>%
+  ## plot lolliplots/forest
+ggplot(aes( y=analyte)) +
+  geom_linerange(aes(xmin=down, xmax=up,color=var,alpha=significant) ) + 
+  geom_point(aes(x=estimate,color=var,alpha=significant), shape=16, size=3) +
+  facet_grid(.~ model, scales = "free")+
+  ## aesethic: 
+  theme_classic() + theme(legend.position = "top") + 
+  ggstats::geom_stripped_rows()  + 
+  scale_color_manual(values=c( "eGFR"="#A8CDECFF", "UACR"="#F6955EFF"), name="") + 
+  scale_y_discrete(labels= labels) +
+  scale_alpha_manual(values=c(0.4,1), labels=c("FDR< 0.05","FDR > 0.05" )) +
+  labs(y=NULL ,
+       color="coef",
+       alpha=NULL,
+       x=" beta coefficients of eGFR and UACR")
+
+ggsave("~/Projects/4cstudy/Plots/Figure2/forest_betacoef_eGFR_UACR_alone_combined_full_sortedegfr.pdf", width=8,height=7.5)
+```
+
+####  alburie based
+```{r}
+analyte_estimate_size <- only_alburie_sa_lm_res  %>% arrange(estimate) %>% pull(analyte)
+alburie_egfr_sa_lm_res  %>% mutate(model="alburie +egfr",var="alburie")   %>%  rbind(.,only_alburie_sa_lm_res %>% mutate(model="alburie",var="alburie")) %>%
+ rbind(.,alburie_all_sa_lm_res%>% mutate(model="full model",var="alburie") )%>%
+  ## filter for FDR 
+  group_by(analyte)%>%  filter(any(FDR < 0.05)) %>% mutate(significant=FDR<0.05) %>% ## naming models for plot
+  mutate(analyte=factor(analyte,levels = analyte_estimate_size)) %>%
+  ## plot lolliplots/forest
+ggplot(aes( y=analyte)) +
+  geom_point(aes(x=estimate,color=significant), shape=16, size=3) +
+  geom_linerange(aes(xmin=down, xmax=up,color=significant) ) + 
+  facet_grid(.~ model , scales = "free_x")+
+  ## aesethic: 
+  theme_classic_modified() + theme(legend.position = "top") + ylab("") + xlab(" beta coefficients of log(albuminuria)") + 
+  ggstats::geom_stripped_rows()  + 
+  scale_color_manual(values=c( "grey","black"), labels=c("non-signif.", "signif."), name="") +  scale_y_discrete(labels= labels)
+```
+```{r}
+analyte_estimate_size <- only_scaled_egfr_sa_lm_res  %>% arrange(-estimate) %>% pull(analyte)
+egfr_alburie_sa_lm_res  %>% mutate(model="egfr + alburie",var="alburie")   %>%  rbind(.,only_scaled_egfr_sa_lm_res %>% mutate(model="egfr",var="alburie")) %>%
+ rbind(.,egfr_all_sa_lm_res%>% mutate(model="full model",var="alburie") )%>%
+  ## filter for FDR 
+  group_by(analyte)%>%  filter(any(FDR < 0.05)) %>% mutate(significant=FDR<0.05) %>% ## naming models for plot
+  mutate(analyte=factor(analyte,levels = analyte_estimate_size)) %>%
+  ## plot lolliplots/forest
+ggplot(aes( y=analyte)) +
+  geom_point(aes(x=estimate,color=significant), shape=16, size=3) +
+  geom_linerange(aes(xmin=down, xmax=up,color=significant) ) + 
+  facet_grid(.~ model , scales = "free_x")+
+  ## aesethic: 
+  theme_classic_modified() + theme(legend.position = "top") + ylab("") + xlab(" beta coefficients of eGFR") + 
+  ggstats::geom_stripped_rows()  + 
+  scale_color_manual(values=c( "grey","black"), labels=c("non-signif.", "signif."), name="") +  scale_y_discrete(labels= labels)
+```
+
+
+
+### Splitted in Diagnose 
+
+run the egfr model for each diagnose group separately 
+comparing egfr beta estimated between the disease groups 
+```{r}
+## dataframe to save all results for each diagnose and protein combination
+diagnose_linearmodel_splitted <-  data.frame(matrix(ncol=8,nrow=0))
+names(diagnose_linearmodel_splitted) <-   c("analyte", "adjRsqr", "p_valRsqr", "pval", "estimate", "down", "up", "diagnose")
+
+# iterate, run model for each disease group
+for (dia in  levels(factor(BL_data_bpoffice$diagnose2)) ){
+  ## get subset from clinical data 
+  BL_split <- BL_data_bpoffice %>% filter(diagnose2==dia) %>% arrange(patid)
+  ## run egfr model protein ~ eGFR
+ res<-  run_coefficent_egfr(data = olink_data %>% filter(patid %in% BL_split$patid) %>% arrange(patid), 
+                                  predictors =  BL_split  %>% dplyr::select(egfr) , 82,158) 
+ 
+ res <- res %>%mutate( analyte=str_replace(analyte,"^rawscale_","")) %>% mutate(across(c(estimate,up,down), as.numeric)) %>% mutate(diagnose=dia)
+
+# save results
+ diagnose_linearmodel_splitted <- diagnose_linearmodel_splitted %>% rbind(res)
+  
+}
+```
+
+plot results as forest plot for all FDR survivors
+
+same plot, once all in one "column", one plot
+```{r}
+#filter for signifiance
+diagnose_linearmodel_splitted %>%  group_by(analyte)%>% filter(any(FDR < 0.05)) %>% mutate(significant=FDR<0.05) %>% 
+# plot , separation in groups by setting color=diagnose
+ggplot(aes( y=reorder(analyte, -as.numeric(estimate)))) +
+  geom_point(aes(x=estimate,color=diagnose, alpha=significant),position = position_dodge(width = 1), shape=16, size=3) +
+  geom_linerange(aes(xmin=down, xmax=up,color=diagnose, alpha=significant),position = position_dodge(width = 1) ) +
+  # aesthetics
+  theme_classic() + ylab("") + xlab(" beta coefficients of egfr") + ggstats::geom_stripped_rows()  +  scale_color_paletteer_d("PrettyCols::Bold", name="") + 
+  ## alpha: signficant or not
+  scale_alpha_discrete(range=c(0.5,1)) 
+#ggsave("~/Documents/4CStudy/Plots/forest_betacoefficients_split_diagnose.pdf", width=6,height=12)
+```
+
+same plot but separarted for each diagnose, and then but next to each other
+```{r}
+diagnose_linearmodel_splitted %>%  group_by(analyte)%>% filter(any(FDR < 0.05)) %>% mutate(significant=FDR<0.05) %>% 
+ggplot(aes( y=reorder(analyte, -as.numeric(estimate)))) +geom_point(aes(x=estimate,color=diagnose, alpha=significant), shape=16, size=3) +
+  geom_linerange(aes(xmin=down, xmax=up,color=diagnose, alpha=significant) ) + theme_classic() + ylab("") + xlab(" beta coefficients of egfr") + ggstats::geom_stripped_rows()  +  scale_color_paletteer_d("PrettyCols::Bold", guide="none") + scale_alpha_discrete(range=c(0.7,1)) + facet_grid(.~ diagnose, scales = "free") + theme(legend.position = "bottom")
+#ggsave("~/Documents/4CStudy/Plots/forest_betacoefficients_split_diagnose_nextoteachother.pdf", width=10,height=6)
+```
+
+## Contrast
+
+1. Run ANCOVA 3 on simple model: analyte ~ country/diagnose + eGFR , adjusting for eGFR
+2. FDR on ANCOVA p-val 
+3. on signficiant models (FDR <0.05), post-hoc contrast check  via emmeans
+
+```{r}
+library(emmeans)
+library(rstatix)
+```
+
+### Functions 
+ANCOVA: 
+function to run ancova for each protein 
+data: olink data frame: protein npx values 
+predictor: set of clinical variable: egfr and diagnose/country
+start,end, positioning of proteins in data
+```{r}
+run_ancova <- function(data, predictor, group="diagnose2", start,end){
+  res <- data.frame(matrix(ncol=2,nrow=0))
+  names(res) <- c("analyte", "pval")
+  j<-1
+  for( i in start:end){
+    ## get protein
+    y <- data.matrix(data[,i])
+    analyte<- names(data)[i]
+  
+    # Perform ANCOVA 
+    formula<- formula(paste("analyte ~ egfr+ ", group))
+    anova_result <- predictor %>% mutate(analyte=y) %>% anova_test(formula)
+    anova_result <- get_anova_table(anova_result)
+   
+    # Store the analyte and corresponding p-value
+    res[j,] <- c(analyte, anova_result[2, "p"])
+    j <- j+1
+  
+  }
+  return(res)}
+```
+
+
+Posthoc Contrast 
+function to run the contrast after ancova , with emmeans
+
+data: olink data 
+predictors : clinical data (diagnose, country information)
+contr: which contrast sets should be investigated : diagnose or country 
+maingrp: decided which contrast matrix design is chosen, if NA then one vs all , other wise  maingrp vs minorgrp xx
+```{r}
+posthoc_contrast_check <- function(data, predictors, contr="diagnose", maingrp=NA){
+  ## return dataframe saving name of protein,contrasts, estimates, cis , p-vals,...
+  res <- data.frame(matrix(ncol=10,nrow=0))
+  names(res) <- c("analyte","contrast", "estimate" ,"SE", "df","lower.CL","upper.CL","t.ratio", "p.value" )
+  
+  ## for each protein , run the contrasts
+  j<-1
+  for( i in 1:ncol(data)){
+    
+    y <- data.matrix(data[,i])
+    analyte<- names(data)[i]
+    ## linear model: protein ~ group (diagnose or country)
+    lm=(lm(scale(analyte)~.,predictors %>% mutate(analyte=y)))
+    
+    categories_levels <- levels(predictors[,contr])
+
+if (is.na(maingrp)){
+      # Create the contrasts automatically for a "one vs all" comparison
+      contrast_list <- lapply(categories_levels, function(cat) {
+      contrast_vector <- rep(-1 / (length(categories_levels) - 1), length(categories_levels))
+      contrast_vector[categories_levels == cat] <- 1
+      contrast_vector
+      })
+      names(contrast_list) <- lapply(categories_levels, function(i) paste(i, "vs all"))
+}
+else{ ## Turkey/CAKUT vs all other
+  contrast_list <- lapply( categories_levels[ categories_levels != maingrp], function(country) {
+    contrast_vector <- rep(0, length( categories_levels))  # Start with a vector of 0s
+    contrast_vector[ categories_levels == maingrp] <- 1  # Set Turkey/CAKUT to +1
+    contrast_vector[ categories_levels == country] <- -1  # Set the other country/diagnose to -1
+  
+   
+    return(contrast_vector)
+  })
+   # Name the contrast as "Turkey vs Country" or "CAKUT vs Disease"
+  names(contrast_list) <- lapply(categories_levels[categories_levels!=maingrp], function(i) paste(maingrp, " vs ", i))
+ 
+}
+  # Use emmeans to apply the contrast
+  contrast_results <- emmeans::emmeans(lm, specs=contr, contr = contrast_list)
+ 
+  ## save results of contrasts
+  ## contrasts: estimate, tukey adjusted pval, CIs,
+  ## standardized effect size
+  res <- res %>% rbind(data.frame(summary(contrast_results, infer=c(T,T))$contrasts
+)  %>% mutate(analyte=analyte,.before=contrast) %>% 
+  mutate(effect_size=data.frame(eff_size(contrast_results, sigma=sigma(lm),edf=Inf))$effect.size
+)) 
+  }
+  return(res)
+
+}
+```
+
+### Run ANCOVA 
+run ancova protein ~ egfr + diagnose/country 
+and save the proteins with signficant association with diagnose/country (FDR <0.05)
+```{r}
+##### diagnose
+signifi_analytes_diangose_ancova<- run_ancova(data=olink_data %>% filter(patid != pat_withoutegfr) %>% arrange(patid), predictor = data.frame(select(BL_data_bpoffice,egfr,diagnose2)), group="diagnose2", 82,158)
+## FDR filter
+signifi_analytes_diangose_ancova<-  signifi_analytes_diangose_ancova %>% filter(p.adjust(pval,"fdr") < 0.05) %>% pull(analyte)
+```
+
+```{r}
+#### country
+signifi_analytes_country_ancova<- run_ancova(data=olink_data %>% filter(patid != pat_withoutegfr) %>% arrange(patid), predictor = data.frame(select(BL_data_bpoffice,egfr,country)), group = "country", 82,158)
+## fdr filter
+signifi_analytes_country_ancova<-signifi_analytes_country_ancova%>% filter(p.adjust(pval,"fdr") < 0.05) %>% pull(analyte)
+```
+### Run Contrast
+run contrasts for ancova signifcant associations
+contrast design: CAKUT and Turkey as main groups
+```{r}
+posthoc_contras_result <- posthoc_contrast_check(olink_data %>% filter(patid != pat_withoutegfr) %>% arrange(patid) %>% select(signifi_analytes_diangose_ancova), data.frame(BL_data_bpoffice  %>% arrange(patid) %>% select(diagnose2,egfr,age,sex,bmisds) %>% mutate(diagnose2=factor(diagnose2))), contr="diagnose2", maingrp="CAKUT")
+
+country_posthoc_contras_result <- posthoc_contrast_check(olink_data %>% filter(patid != pat_withoutegfr) %>% arrange(patid) %>% select( signifi_analytes_country_ancova ), data.frame(BL_data_bpoffice %>%  arrange(patid) %>% select(country,egfr,age,sex,bmisds) %>% mutate(country=factor(country))), contr = "country", maingrp="Turkey")
+```
+
+### Visualize 
+as heatmap , color is the standardized effect size, and star annotated tukey adj. signficant pvalues
+```{r}
+library(ComplexHeatmap)
+visualize_contrast_res <- function(posthoc_contras_result){
+
+# plotting only proteins with at least one signifcant contrast
+    
+## effect size coloring
+heatmap_data <- posthoc_contras_result %>% group_by(analyte) %>% filter(any(p.value < 0.05) ) %>% ungroup()%>%mutate( analyte=str_replace(analyte,"^rawscale_","")) %>%
+  select(analyte, contrast, effect_size) %>%
+  pivot_wider(names_from = contrast, values_from = effect_size, values_fill = 0) %>%
+  column_to_rownames("analyte") %>%
+  as.matrix()
+
+## star annotations
+signif_matrix <- posthoc_contras_result %>% group_by(analyte) %>% filter(any(p.value < 0.05) ) %>% ungroup() %>%
+ mutate( analyte=str_replace(analyte,"^rawscale_","")) %>%
+  select(analyte, contrast, p.value) %>%
+  pivot_wider(names_from = contrast, values_from = p.value, values_fill = 0) %>%
+  column_to_rownames("analyte") %>%
+  as.matrix()
+ 
+
+### labels 
+labels <- read_excel("~/Projects/4cstudy/ClinicalData/analyte_abbrev_HB.xlsx") 
+labels <- labels %>% filter(analyte %in% rownames(heatmap_data)) %>% arrange(factor(analyte,levels= rownames(heatmap_data))) %>% pull(name)
+
+rownames(heatmap_data) <- labels
+rownames(signif_matrix) <- labels
+# Generate heatmap with annotations
+heatmap <- Heatmap(
+  heatmap_data,
+  name = "Effect Size",
+  col = circlize::colorRamp2(c(min(heatmap_data), 0, max(heatmap_data)), rev(c("#075AFF", "#FFFFCC", "#FF0000"))),
+  cluster_rows = TRUE,
+  cluster_columns = F,
+  show_row_dend = F,
+  show_column_dend = F,
+  cell_fun = function(j, i, x, y, width, height, fill) {
+   if(signif_matrix[i, j] < 0.001) {
+        grid.text("***", x, y)
+    } else if(signif_matrix[i, j] < 0.01) {
+        grid.text("**", x, y)
+    }
+    else if(signif_matrix[i, j] < 0.05) {
+        grid.text("*", x, y)
+    }
+    else {
+        grid.text("", x, y)
+    }
+  }
+) #
+
+return(heatmap)
+
+}
+```
+
+```{r}
+## diagnose heatmap
+visualize_contrast_res(posthoc_contras_result %>% mutate(contrast=if_else(endsWith(contrast,"loss"), "CAKUT vs postAKI/HUS",contrast))) 
+
+## country heatmap
+visualize_contrast_res(country_posthoc_contras_result)
+
+## save contrast results
+posthoc_contras_result %>% mutate(contrast=if_else(endsWith(contrast,"loss"), "CAKUT vs postAKI/HUS",contrast), 
+                                  analyte=str_remove(analyte,"rawscale_")) %>% write.table(file="~/Projects/4cstudy/Tables/diagnose_contrast_results.csv", sep = ",",row.names = F)
+
+country_posthoc_contras_result %>% mutate(analyte=str_remove(analyte,"rawscale_")) %>% write.table(file="~/Projects/4cstudy/Tables/country_contrast_results.csv", sep = ",",row.names = F)
+
+```

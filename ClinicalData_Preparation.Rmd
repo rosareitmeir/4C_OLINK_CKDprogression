@@ -1,0 +1,422 @@
+---
+title: "Clinical Data Preparation"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+```{r include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+#source("Functions.R")
+library(readxl)
+library(paletteer)
+```
+
+## 0. Read Files
+
+```{r echo=TRUE, warning=FALSE}
+
+abpm_file <- read_excel("C:/Users/rosa/Documents/4CStudy/ClinicalData/abpm_dataset_4C_for_OLINK_with_SDS_values_by_lms_method_for_abpm_measures_(JH-24-NOV-2024).xlsx")
+investigation_file <- read_excel("C:/Users/rosa/Documents/4CStudy/ClinicalData/investigation_dataset_4C_for_OLINK_WITH_SDS_Values_by_lms_method_for_cimt_and_pwv_(JH-16-NOV-2024).xlsx")
+
+medication_file <- read_excel("C:/Users/rosa/Documents/4CStudy/ClinicalData/medication_dataset_4C_for_OLINK.xlsx")
+patients_file <- read_excel("C:/Users/rosa/Documents/4CStudy/ClinicalData/patients_dataset_4C_for_OLINK.xlsx")
+
+addedinfo_file <- read_excel("C:/Users/rosa/Documents/4CStudy/ClinicalData/4C_Serum_Olink.xlsx")
+olink_data <- read.csv("Documents/4CStudy/Tables/OLINK_data.tsv",  sep = "\t",header=T) %>% arrange(pat_id) %>% rename(patid=pat_id) 
+
+pat_with_olink <- olink_data$patid
+```
+
+
+
+## LVMI calculation 
+based on paper xx 
+```{r}
+investigation_file <- investigation_file %>% mutate(lvmi_above95 = case_when(sex=="male" ~ 77.5265 - age_in_years_at_vdate
+ * 15.8939 + (age_in_years_at_vdate^1.5) * 5.2322 - (age_in_years_at_vdate^2) * 0.4671 + 2.7380,
+                             T ~  77.5265 - age_in_years_at_vdate * 15.8939 + (age_in_years_at_vdate^1.5) * 5.2322 - (age_in_years_at_vdate^2) * 0.4671) ) %>% mutate(lvmi_critical=lvmi >= lvmi_above95)
+
+
+```
+
+## eGFR check
+
+Schaefer: Nine patients were excluded because of eGFR>60 ml/min per 1.73 m2, and seven were excluded due to missing eGFR at the first study visit, leaving a final cohort of 688 patients with CKD stages 3–5
+
+comaprison with other 4C paper
+
+```{r}
+## 704 patients in line with schäfer
+investigation_file %>% filter(month==0) %>% summarise(n())
+baseline_file <- investigation_file %>% filter(month==0)
+
+####### eGFR 
+## distirbution of egfr values , 24 missing egfr values 
+summary(baseline_file$egfr)
+#baseline_file %>% filter(b_gfr > 60)
+baseline_file %>% select(egfr,b_gfr)  ## -> similiar values, but more in egfr than b_gfr 
+
+####### ckd stage 
+table(baseline_file$ckd1)
+nrow(baseline_file %>% filter(is.na(ckd1))) 
+
+## 25 missing diagnosis , 16 more than in schäfer # schaefer numbers 3a: 50 	3b:216 	4:370 	5:52 	total 688
+
+#baseline_file <- baseline_file  %>% filter(!is.na(ckd1))
+baseline_file %>% filter(is.na(egfr))
+
+```
+
+what we could do is taken the b_egfr ( baseline egfr column) in case egfr is not given 
+but then we have different numbers of ckd stages 
+as followed: 
+
+```{r}
+## 14 with b_gfr  but not egfr value 
+investigation_file %>% filter(month==0) %>% filter(is.na(egfr) & !is.na(b_gfr))
+  
+baseline_file <- investigation_file %>% filter(month==0) %>% mutate(egfr=case_when(is.na(egfr)~b_gfr, T~egfr)) %>% 
+mutate(ckd1= case_when(is.na(ckd1) & egfr > 60 ~ "2 (60-<90)",
+                         is.na(ckd1) & egfr < 60 & egfr > 45 ~ "3a (45-<60)",
+                         is.na(ckd1) & egfr < 45 & egfr > 30 ~ "3b (30-<45)",
+                         is.na(ckd1) & egfr < 30 & egfr > 15 ~ "4 (15-<30)",
+                         is.na(ckd1) & egfr < 15 ~ "5 (<15)",
+                         T ~ ckd1))  
+baseline_file %>% filter(is.na(ckd1))
+baseline_file  %>% pull(ckd1 ) %>% table(.)
+
+## more 3b than in schaefer
+```
+
+### Added Info File
+
+```{r}
+table(addedinfo_file$Diagnose_original)
+summary(addedinfo_file$egfr_original)
+
+addedinfo_file %>% ggplot(aes(x=Diagnose_original, y=egfr))+ geom_boxplot()
+baseline_file %>% ggplot(aes(x=ckd1, y=egfr)) + geom_boxplot()
+
+baseline_file <- baseline_file %>% full_join(addedinfo_file, by="patid", suffix=c("", "_added")) 
+
+
+summary(baseline_file$egfr - baseline_file$egfr_original)
+baseline_file %>% select(ckd1,Diagnose_original,ckd_added,ckd_bedside,egfr,egfr_original,b_gfr,patid) %>% filter(is.na(ckd1)) 
+
+## for the three cases of egfr and having a olink 
+baseline_file <- baseline_file %>% mutate(egfr= case_when(is.na(ckd1)~ egfr_original, T~egfr)) %>% mutate(ckd1= case_when(is.na(ckd1) & egfr< 30 & egfr > 15 ~ "4 (15-<30)", T ~ckd1))
+
+ckd1_numbers <- baseline_file %>% filter(patid %in% olink_data$pat_id) %>% count(ckd1)
+ckd1_olink_numbers <- baseline_file %>% filter(patid %in% pat_with_olink) %>% count(ckd1)
+
+```
+
+## center site  & filter olink
+only patients with olink sample (683)
+adding country of origin as info 
+```{r}
+baseline_file %>% select(center,center_name) %>% distinct() %>% arrange(center)
+
+baseline_file <- baseline_file  %>% filter(patid %in% pat_with_olink) %>% mutate(country= case_when( startsWith(center,"ank")|  startsWith(center,"is")| center %in% c("ada","izm","bu2","bur","gaz","iz2","mal","man","san") ~"Turkey", center %in% c("mue","ros","jen","lei","mar","ham","han","hei","col","erl","ess","fre","ber")~"Germany", center %in% c("bor","lyo","str")~"France", center %in% c("pad","mil","gen","rom","bol") ~"Italy", center %in% c("war","szc","cra","gda")~"Poland", center =="lon" ~"UK",center %in% c("inn","vie")~"Austria",center =="bel" ~"Serbia", T ~"others" )) 
+
+baseline_file %>% pull(country) %>% table(.)
+```
+
+### country plot 
+
+```{r}
+country_colors <- c(
+  Austria = "#FF4D6FFF",
+  France = "#579EA4FF",
+  Germany = "#DF7713FF",
+  Italy = "#F9C000FF",
+  others = "#86AD34FF",
+  Poland = "#5D7298FF",
+  Serbia = "#81B28DFF",
+  Turkey = "#7E1A2FFF",
+  UK = "#2D2651FF",
+  notTurkey="#334e82" #"#644d8d"
+)
+
+# Prepare the data
+plot_data <- baseline_file %>%
+  distinct(patid, center, country) %>%
+  mutate(center = gsub('[0-9]+', '', center)) %>% # Remove numbers from center names, merging centers from same city together
+  count(country, center) %>%
+  ## duplicate patids not from turkey, as "notTurkey"
+  rbind(c("notTurkey", "", nrow(baseline_file %>% filter(country != "Turkey") %>% distinct(patid)))) %>%
+  mutate(n = as.numeric(n)) %>%
+  arrange(country, center) # Ensure centers are sorted within each country
+
+# Generate gradient colors dynamically
+# Create a list of gradients for each country
+gradient_colors <- unlist(
+  lapply(unique(plot_data$country), function(country) {
+    base_color <- country_colors[country]
+    centers <- plot_data %>% filter(country == !!country) %>% pull(center)
+    
+    # Create a gradient palette for the centers
+    colors <- colorRampPalette(c(base_color, "white"))(length(centers)+1)
+    
+    # Assign center names to the colors
+    setNames(colors, centers)
+  })
+)
+# Map the gradient colors back to each center
+plot_data <- plot_data %>%
+  mutate(center_color = unlist(gradient_colors[match(country, names(gradient_colors))]))
+
+# Create the bar plot
+ggplot(plot_data, aes(x = reorder(country, n, sum), y = n, fill = center)) +
+  geom_bar(position = "stack", stat = "identity") +
+  coord_flip() +
+  # Add labels for the center names on the stacked bars
+  geom_text(
+    aes(label = center),
+    position = position_stack(vjust = 0.5), # Center labels within stacks
+    size = 2,
+    angle=90,
+    color = "black"
+  ) +
+  # Use the dynamically generated gradient colors
+  scale_fill_manual(values = gradient_colors) +
+  labs(
+    x = "",
+    y = "Number of Patients",
+  ) +
+  theme_classic() + theme(legend.position = "none")
+
+#ggsave("~/Documents/4CStudy/Plots/bar_country_distribution.pdf", width=6,height=3)
+
+```
+
+
+## 1 Descriptive Statistics 
+all following descriptive statisticss for the patients with olink sample and having a eGFR at study entrance
+### CKD and diagnose
+distirbution of diagnoses in the different ckd stages
+
+```{r}
+patients_file  %>% right_join(.,  baseline_file %>% select(patid,ckd1,egfr), by="patid") %>% filter(patid %in% pat_with_olink & !is.na(ckd1)) %>%
+  rename(postAKI_HUS=nephloss)  %>% mutate(diagnose2=case_when(diagnose2=="Nephloss"~"postAKI/HUS",T~diagnose2)) %>%
+  mutate(diagnose2=factor(diagnose2, levels=rev(c("Other", "postAKI/HUS", "Glomerulopathies","Tubint", "CAKUT")))) %>%
+  group_by(ckd1) %>% count(diagnose2)%>%  mutate(perc=n/sum(n) ) %>% arrange(ckd1,diagnose2) %>% 
+  
+  ggplot(aes(x=ckd1, y=perc, fill=diagnose2)) + 
+  geom_col(position=position_stack()) + 
+  geom_text(aes(label=n), position = position_stack(vjust =0.5), size =3.5, color="white") + 
+  theme_classic()+ theme(axis.text.x = element_text(angle = 45,hjust=1)) + xlab("") + ylab("")+ 
+  scale_fill_paletteer_d("PrettyCols::Bold", name="")
+
+#ggsave("~/Documents/4CStudy/Plots/bar_CKD_diagnose.pdf", width=6,height=4)
+
+```
+eGFR values for the different diagnose groups 
+```{r}
+patients_file  %>% right_join(.,  baseline_file %>% select(patid,ckd1,egfr), by="patid") %>% filter(patid %in% pat_with_olink & !is.na(ckd1)) %>%
+  rename(postAKI_HUS=nephloss)  %>% mutate(diagnose2=case_when(diagnose2=="Nephloss"~"postAKI/HUS",T~diagnose2)) %>%
+
+  ggplot(aes(y=egfr, x =diagnose2, fill=diagnose2)) + 
+  geom_boxplot()+
+ theme_classic()+ theme(axis.text.x = element_text(angle = 45,hjust=1)) + xlab("") + ylab("")+ 
+  scale_fill_paletteer_d("PrettyCols::Bold", guide="none") + ylab("eGFR")
+  #scale_fill_paletteer_d("fishualize::Callanthias_australis",name="")
+  #scale_fill_paletteer_d("nationalparkcolors::Badlands")
+
+#ggsave("~/Documents/4CStudy/Plots/boxplot_egfr_diagnose.pdf", width=6,height=4)
+
+```
+
+### missing values 
+
+```{r}
+na_counts <- sapply(baseline_file, function(y) sum(length(which(is.na(y)))))
+na_counts[c("lvmi", "pwv_sds_a", "imt_sds_a", "syssds", "diasds")]
+```
+
+
+
+
+### numeric variables
+
+for all patients with eGFR value at study entry and olink sample
+
+mean and sd values for
+dist_ckd_diag_to_BL: distances in year between the ckd diagnosis and baseline assessment
+age_in_years_at_vdate: age at baseline
+gestage: gestational age 
+bweight/height: birth weight and height 
+egfr
+blood values (salb,...)
+blood pressure values (dia, sys)
+
+```{r warning=FALSE}
+numericvar <- c("heightsds","bmisds","age_in_years_at_vdate","egfr", "alburie", "urea", "salb", "bicar","hb","phosphaturie","diasds","syssds")
+
+## mean for each ckd stage
+patients_file  %>% right_join(.,  baseline_file %>% filter(patid %in% pat_with_olink &!is.na(ckd1)) %>% 
+                                select(patid, ckd1, numericvar ), by="patid")  %>% mutate(dist_ckd_diag_to_BL=-age_in_years_at_ckd2date+age_in_years_at_vdate,egfr) %>% group_by(ckd1) %>% 
+summarise(across(c(dist_ckd_diag_to_BL,numericvar), list(mean = mean, sd = sd),na.rm=T)) %>%
+  left_join(BL_ckd1_olink_numbers,., by="ckd1")#%>% #write.table(.,  "~/Documents/4CStudy/Tables/cohortdescription_numericalvariables_n683_divided_CKDstages.tsv", row.names=F, quote=F,na="NA", sep="\t")
+
+
+## mean all together
+patients_file  %>% right_join(.,  investigation_file %>% filter(month==0) %>% select(patid, numericvar), by="patid") %>%   mutate(dist_ckd_diag_to_BL=-age_in_years_at_ckd2date+age_in_years_at_vdate,egfr) %>% 
+summarise(across(c(dist_ckd_diag_to_BL,numericvar), list(mean = mean, sd = sd),na.rm=T))# %>% #write.table(.,  "~/Documents/4CStudy/Tables/cohortdescription_numericalvariables_n683.tsv", row.names=F, quote=F,na="NA", sep="\t")
+
+```
+
+## Define BL dataframe
+```{r}
+BL_data_bpoffice <- baseline_file %>%right_join(patients_file %>% select(-sex,-gender,-ethnicf,-ethnicm),., by="patid")
+
+BL_data_bpoffice <- BL_data_bpoffice %>% mutate(CAKUT= case_when(diagnose2=="CAKUT"~"yes", T~"no"))
+```
+
+## 2 CVD endpoints
+sds above 3 as "endpoint"
+```{r}
+BL_data_bpoffice <- BL_data_bpoffice %>% mutate(across(
+    c(ends_with("sds_a"),syssds,diasds) , 
+    ~ ifelse(. > 2, 1, 0),  # Check if the value is above 2, assign 1 if TRUE, 0 if FALSE
+    .names = "{.col}_above2" # Create new columns with a suffix "_above2"
+  )) %>% mutate(lvmi_critical= as.numeric(lvmi_critical))
+
+```
+
+## 3. Medication 
+
+### Data Cleaning 
+immune suppressants -> olink data 
+antihypertensive medication for cvd endpoints (schaefer et al , preprint Doyon et al)
+
+antihypertension treatment:
+other diuretics, loop diuretics, alpha and beta blockers, calcium channel blockers, RAS inhibitors
+
+other drugs:
+laxatives, potassium-related medications, anti-epileptics
+
+considering all mediaction, where the age at BL is between the start age and stop age of taken this medication
+```{r}
+## 351 patients taken medication when month==0, also when olink is taken 
+
+# with 1 to 13 drugs, median 4 drugs 
+summary(right_join(medication_file, investigation_file %>% filter(month==0 ) %>% select(patid,age), by="patid") %>% filter(age >=age_in_years_at_startdate & age <=age_in_years_at_stopdate) %>% count(patid) %>% pull(n))
+
+## impact on olink and/or cvd measurements 
+medication_at_BL<- right_join(medication_file, investigation_file %>% filter(month==0 ) %>% select(patid,age), by="patid") %>% filter(age >=age_in_years_at_startdate & age <=age_in_years_at_stopdate)
+```
+
+change the medigroup for some med ids
+```{r}
+medication_at_BL <- medication_at_BL %>% mutate(
+      medigr= case_when(medid=="Bendroflumethiazide" ~  "Thiazide Diuretics",
+      medid=="Polistiren sülfonat" | medid== "Sodium polystiren sulfonate" ~ "Ca-P-Bind",
+      medid=="Choledtyramine" | medid=="Omega-3 fatty acids" ~ "Non-Statin Lipid Lowering Agent",
+      medid=="Eculizumab" ~ "Immunsuppressiva",
+      startsWith(medid,"Vitamin B") ~ "Vitamin B compounds",
+      medid=="Shohl" ~ "Acidosis Treatment",
+      endsWith(medid, "sone") ~ "Immunsuppressiva",
+      is.na(medigr) ~ "others",
+      T ~ medigr)) 
+
+medication_at_BL <- medication_at_BL %>% mutate(medigr2= case_when(RAS=="yes"~ "RAS inhibitors", 
+                                                                   endsWith(medigr,"alpha blocker")~ "Alpha-Blockers", 
+                                                                   medigr=="Potassium sparing diuretics" | medigr=="Thiazide Diuretics"~"other diuretics",
+                                                                   T~medigr))
+
+medication_at_BL_wide <- medication_at_BL%>% select(patid, age_at_medication=age,medigr2) %>% distinct(patid, medigr2) %>% mutate(taken=1) %>%pivot_wider(names_from=medigr2, values_from=taken) %>% mutate_all( ~replace_na(.,0)) 
+
+names(medication_at_BL_wide)[-1] <- paste0("medigr_", names(medication_at_BL_wide)[-1])
+
+# add information to BL data frame
+BL_data_bpoffice <- BL_data_bpoffice %>% left_join(medication_at_BL_wide, by="patid")
+```
+
+
+### Anti Hypertension Medications
+define whether patient is on antihpyertensive medication 
+```{r}
+aht_drugs <- paste0("medigr_", c("Beta-Blocker", "RAS inhibitors","Loop Diuretics", "Alpha-Blockers", "Ca-Blocker","other diuretics"))
+
+BL_data_bpoffice <- BL_data_bpoffice %>% rowwise()%>%  mutate(sum_medication = sum(c_across(starts_with("medigr")), na.rm = TRUE) ) %>%  mutate(sum_AHT = sum(c_across(aht_drugs), na.rm = TRUE) ) %>% mutate(AHT= as.numeric(sum_AHT>0))
+
+```
+
+
+### CVD and Hypertension Groups
+
+hypertension classes 
+four category : AHT treatment (yes/no) vs dia/sys > 2 
+and binary class:( AHT treatment or dia>sys > 2 ) vs none hypertension signs
+```{r}
+BL_data_bpoffice <- BL_data_bpoffice %>% mutate(hyper_treat_group=  case_when(AHT==1 & (diasds >2 | syssds >2) ~ "treated_uncontrolled",
+                                                    AHT==1 & (diasds <2 & syssds <2) ~ "treated_norm",
+                                                    AHT!=1 & (diasds >2 | syssds >2) ~ "untreated_uncontrolled",
+                                                    AHT!=1 & (diasds <2 & syssds <2) ~ "untreated_norm"
+                                                  
+                                                    ), hyper_class= case_when(AHT==1 | diasds >2 | syssds>2 ~ "yes", T~"no"))
+```
+
+
+## CVD manifestations
+```{r}
+BL_data_bpoffice <- BL_data_bpoffice %>% group_by(patid) %>% mutate(cvd_manifestation = sum(lvmi_critical, imt_sds_a_above2, pwv_sds_a_above2, na.rm=T) ) %>% ungroup()
+```
+
+## SAVE BL data bp office
+used for all other analysis
+```{r}
+write.table( BL_data_bpoffice , "~/Documents/4CStudy/Tables/BL_data_bpoffice.tsv", row.names=F, quote=F,na="NA", sep="\t")
+```
+
+
+## Categorical Variables Statistics 
+
+#### categorical values 
+
+same procedure as for the numerical variables
+overall patients and once separated by ckd stage 
+calculating number and percentage of occurrence for each subcategory 
+```{r}
+
+categorical_columns <- c("sex", "diagnose2", "sga", "physact","country", "medigr_RAS.inhibitors", "hyper_class")
+
+patients_file  %>% right_join( BL_data_bpoffice %>% filter(patid %in% olink_data$pat_id & !is.na(ckd1)) %>% select(patid, ckd1, physact,country, medigr_RAS.inhibitors, hyper_class) %>% mutate(across(c(medigr_RAS.inhibitors,hyper_class), as.character)) %>% filter(patid != pat_withoutegfr), by="patid") %>% group_by(ckd1)  %>%
+pivot_longer(cols = all_of(categorical_columns), names_to = "variable", values_to = "category") %>%
+  # Count occurrences of each category within each group and variable
+  #filter(!is.na(category)) %>%
+  mutate(total_patients = n_distinct(patid)) %>%
+  count(ckd1, variable, category,total_patients) %>%
+  # Calculate the percentage of each category within each group and variable
+  mutate(percentage =( n / total_patients)* 100) %>%
+  # Reshape data: make each category a separate column for each variable
+  mutate(varcar=paste(variable,category,sep="_"))%>%
+  select(-c(variable,category,total_patients)) %>%
+  pivot_wider(
+    names_from = c("varcar"),
+    values_from = c(percentage,n),
+  ) %>% select(sort(names(.))) %>% relocate(contains("sex"), .after=ckd1) %>%
+  left_join(BL_ckd1_olink_numbers,., by="ckd1")  %>% write.table(.,  "~/Documents/4CStudy/Tables/cohortdescription_categoricalvariables_n683_divided_CKDstages.tsv", row.names=F, quote=F,na="NA", sep="\t")
+
+patients_file  %>% right_join( BL_data_bpoffice%>% filter(patid %in% olink_data$pat_id & !is.na(ckd1))  %>% select(patid, ckd1, physact,country, medigr_RAS.inhibitors, hyper_class) %>% mutate(across(c(medigr_RAS.inhibitors,hyper_class), as.character)) %>% filter(patid != pat_withoutegfr), by="patid") %>%
+pivot_longer(cols = all_of(categorical_columns), names_to = "variable", values_to = "category") %>%
+  # Count occurrences of each category within each group and variable
+  #filter(!is.na(category)) %>%
+  mutate(total_patients = n_distinct(patid)) %>%
+  count(variable, category,total_patients) %>%
+  # Calculate the percentage of each category within each group and variable
+  mutate(percentage =( n / total_patients)* 100) %>%
+  # Reshape data: make each category a separate column for each variable
+  mutate(varcar=paste(variable,category,sep="_"))%>%
+  select(-c(variable,category,total_patients)) %>%
+  select(sort(names(.))) %>% relocate(contains("sex"))  %>% write.table(.,  "~/Documents/4CStudy/Tables/cohortdescription_categoricalvariables_n683.tsv", row.names=F, quote=F,na="NA", sep="\t")
+
+```
+
+
+

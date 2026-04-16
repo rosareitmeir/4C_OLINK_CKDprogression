@@ -1,0 +1,266 @@
+---
+title: "CKD endpoint"
+output: html_notebook
+---
+
+script for defining the composite endpoint ( RRT or 50% eGFR loss)
+and for plots for the ckd progression ( figure 3 endpoint distribution over time)
+
+
+```{r include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(paletteer)
+library(stringr)
+library(tibble)
+```
+
+## 0 Data Input
+```{r}
+investigation_file <- read_excel("~/Projects/4cstudy//ClinicalData/investigation_dataset_4C_for_OLINK_WITH_SDS_Values_by_lms_method_for_cimt_and_pwv_(JH-16-NOV-2024).xlsx")
+
+medication_file <- read_excel("~/Projects/4cstudy//ClinicalData/medication_dataset_4C_for_OLINK.xlsx")
+patients_file <- read_excel("~/Projects/4cstudy//ClinicalData/patients_dataset_4C_for_OLINK.xlsx")
+
+addedinfo_file <- read_excel("~/Projects/4cstudy//ClinicalData/4C_Serum_Olink.xlsx")
+
+olink_data <- read.csv2("~/Projects/4cstudy//Tables/OLINK_data.csv",  sep = ",",header=T) %>% arrange(pat_id) %>% rename(patid=pat_id) %>% mutate(across(starts_with("rawscale"), as.numeric))
+
+### BL_data_bpoffice -> baseline table based on investigation file , more information than investigation_file, end product of the Clinical Data Preparation script, including medication, hypertension,...
+BL_data_bpoffice <-read.csv2("~/Projects/4cstudy/Tables/BL_data_bpoffice.csv",  sep = ",",header=T)
+
+```
+
+
+## 1 Modifcation Investigation File 
+same modification as for the baseline data frame
+
+adding egfr info from other files to the investigation file: 
+what we could do is taken the b_egfr ( baseline egfr column) in case egfr is not given 
+but then we have different numbers of ckd stages 
+as followed: 
+
+```{r echo=TRUE}
+## 14 with b_gfr  but not egfr value 
+investigation_file %>% filter(month==0) %>% filter(is.na(egfr) & !is.na(b_gfr))
+  
+investigation_file <- investigation_file  %>% mutate(egfr=case_when(is.na(egfr) & month==0 ~b_gfr, T~egfr)) %>% 
+mutate(ckd1= case_when(is.na(ckd1) & egfr > 60 ~ "2 (60-<90)",
+                         is.na(ckd1) & egfr < 60 & egfr > 45 ~ "3a (45-<60)",
+                         is.na(ckd1) & egfr < 45 & egfr > 30 ~ "3b (30-<45)",
+                         is.na(ckd1) & egfr < 30 & egfr > 15 ~ "4 (15-<30)",
+                         is.na(ckd1) & egfr < 15 ~ "5 (<15)",
+                         T ~ ckd1))  
+investigation_file %>% filter(month==0) %>% pull(ckd1) %>% table(.)
+## more 3b than in schaefer
+```
+adding more information, and site info 
+```{r echo=TRUE}
+table(addedinfo_file$Diagnose_original)
+summary(addedinfo_file$egfr_original)
+
+investigation_file <- investigation_file %>% full_join(addedinfo_file, by="patid", suffix=c("", "_added")) 
+
+summary(baseline_file$egfr - baseline_file$egfr_original)
+
+investigation_file %>% filter(month==0) %>%select(month,ckd1,Diagnose_original,ckd_added,ckd_bedside,egfr,egfr_original,b_gfr,patid) %>% filter(is.na(ckd1)) 
+## for the three cases of egfr and having a olink 
+investigation_file <- investigation_file %>% mutate(egfr= case_when(is.na(ckd1) & month==0 ~ egfr_original, T~egfr)) %>% mutate(ckd1= case_when(is.na(ckd1) & egfr< 30 & egfr > 15 & month==0 ~ "4 (15-<30)", T ~ckd1))
+
+pat_withoutegfr <- investigation_file %>% filter(month==0 & is.na(egfr) & patid %in% olink_data$patid) %>% pull(patid)
+```
+
+adding center site  and subsetting
+reduce the numbers to patient with olink and egfr 
+```{r}
+investigation_file <- investigation_file  %>% filter(patid %in% olink_data$patid & patid != pat_withoutegfr) %>% ungroup() %>% mutate(country= case_when( startsWith(center,"ank")|  startsWith(center,"is")| center %in% c("ada","izm","bu2","bur","gaz","iz2","mal","man","san") ~"Turkey", center %in% c("mue","ros","jen","lei","mar","ham","han","hei","col","erl","ess","fre","ber")~"Germany", center %in% c("bor","lyo","str")~"France", center %in% c("pad","mil","gen","rom","bol") ~"Italy", center %in% c("war","szc","cra","gda")~"Poland", center =="lon" ~"UK",center %in% c("inn","vie")~"Austria",center =="bel" ~"Serbia", T ~"others" )) 
+```
+
+
+
+
+## 2. RRT Description 
+
+### 2.1 Kidney Transplantation
+```{r}
+investigation_file <- investigation_file  %>% mutate(RRT= case_when(rrt %in% c("APD", "CAPD", "HD")~"Dialysis",grepl( "*Tx*",rrt) ~"Tx" , T~ rrt))
+table(investigation_file %>% pull(rrt))
+
+investigation_file %>% group_by(month) %>% count()
+
+
+## all CKD at month 0, no dialysis or Tx 
+investigation_file %>% filter(month==0 & rrt=="CKD" ) %>% count(ckd1)
+
+## 233 patients getting a new kidney
+nrow(investigation_file %>%  filter( grepl( "*Tx*",rrt) ) %>% distinct(patid))
+
+### 30 month BL most reported number of  transplantations
+investigation_file %>%  filter(grepl( "*Tx*",rrt) ) %>% group_by(patid) %>% slice_min(month) %>% ungroup() %>%ggplot(aes(x= as.factor(month), fill=as.factor(month))) + geom_bar() + theme_classic() + xlab("month post BL") + theme(legend.position = "none")
+
+summary(investigation_file %>%  filter(grepl( "*Tx*",rrt) ) %>% group_by(patid) %>% slice_min(month) %>% pull(month))
+# median 36 months post BL measurement
+
+## age at Tx
+summary(investigation_file %>%  filter(grepl( "*Tx*",rrt) ) %>% group_by(patid) %>% slice_min(month) %>% ungroup() %>% arrange(month) %>% pull(age_in_years_at_tpldate))
+
+investigation_file %>% filter(grepl("*Tx*", rrt)) %>% filter(month==12) %>% pull(rrt) %>% table(.)
+```
+
+### 2.2 Dialysis 
+
+```{r}
+## 184 patients on dialysis
+nrow(investigation_file %>%  filter(rrt %in% c("APD", "CAPD", "HD") ) %>% distinct(patid))
+
+investigation_file %>%   filter(rrt %in% c("APD", "CAPD", "HD") ) %>% group_by(patid) %>% slice_min(month) %>% ungroup() %>%
+  ggplot(aes(x= as.factor(month), fill=as.factor(month))) + geom_bar() + theme_classic() + xlab("month post BL")  + guides(fill="none")
+
+## median 24 months post BL on dialysis
+summary(investigation_file %>%   filter(rrt %in% c("APD", "CAPD", "HD") ) %>% group_by(patid) %>% slice_min(month) %>% pull(month))
+
+## 15 years old when on dialysis
+summary(investigation_file %>%   filter(rrt %in% c("APD", "CAPD", "HD") ) %>% group_by(patid) %>% slice_min(month) %>% pull(age_in_years_at_vdate))
+
+
+investigation_file %>% group_by(patid) %>% filter(any(rrt %in% c("APD", "CAPD", "HD")) & any(grepl( "*Tx*",rrt)))
+```
+## 3 Definition CKD endpoint 
+```{r}
+# calculate difference in eGFR from baseline eGFR at every following up visit
+investigation_file <- investigation_file  %>% left_join(investigation_file %>% filter(month==0) %>% select(baseline_egfr=egfr,patid),by="patid")%>%  mutate(egfr_diff = egfr - baseline_egfr) %>% ungroup()
+
+investigation_file %>% group_by(month) %>% count()
+
+```
+
+composite endpoint:
+- 50% eGFR loss from baseline point 
+- on dialysis
+- kidney  transplanatation 
+```{r}
+## reduction of 50% 
+investigation_file <- investigation_file %>% mutate(CKD50= egfr*2 <= baseline_egfr & !is.na(egfr) & !is.na(baseline_egfr) & !is.na(month) & month!=0) %>% ungroup() %>%
+  mutate( RRT=if_else( CKD50  & rrt=="CKD","CKD50", RRT)) 
+
+### 105 patients with 50% decline , median: 36 month
+investigation_file %>% group_by(patid) %>% filter(RRT=="CKD50")  %>% slice_min(month) %>% pull(month) %>% summary(.)
+
+##34 patients without any RRT reaching 50% decline
+investigation_file %>% group_by(patid) %>% filter(any(RRT=="CKD50" ) & !any(RRT %in% c("Tx","Dialysis"))) %>% filter(RRT!="CKD") %>% slice_min(month)  %>% pull(month) %>% summary(.)
+
+
+table(investigation_file$RRT)
+```
+```{r}
+investigation_file %>% group_by(patid) %>% filter(all(RRT=="CKD") & any(egfr<15)) %>% ungroup() %>% arrange(patid) %>% dplyr::select(patid,month,egfr,rrt,RRT)
+
+investigation_file %>% filter(patid ==81)%>% dplyr::select(patid,month,egfr,rrt,RRT)
+```
+
+putting it all together , reached_endpoint: containing all entries where a patient reached their first endpoint
+```{r}
+reached_endpoint <- investigation_file %>%   filter(RRT!="CKD") %>% group_by(patid) %>% slice_min(month) %>% ungroup()
+reached_endpoint
+```
+```{r}
+reached_endpoint %>% ggplot(aes(x=RRT,y=baseline_egfr)) + geom_boxplot()
+```
+
+#### SAVE table
+```{r}
+write.csv(reached_endpoint, "~/Projects/4cstudy/Tables/reached_endpoint.csv",  row.names = F)
+#write.table(investigation_file, "~/Documents/4CStudy/Tables/investigation_file.csv", row.names=F, quote=F,na="NA", sep="\t")
+
+#write.csv(investigation_file, "~/Projects/4cstudy//Tables/investigation_file.csv", row.names=F)
+
+```
+
+#### Fig 3 Endpoint Plot
+developing of reaching endpoint or dropping out over time 
+```{r}
+summary(reached_endpoint$month)
+nrow(reached_endpoint[reached_endpoint$month <= 24,])
+table(reached_endpoint$RRT)
+
+## getting number of dropouts
+dropouts<- investigation_file %>% filter(!is.na(month)  & month < 108) %>% distinct(month,patid) %>% count(month) %>% mutate(cum_n=683-n, n= c( 0, abs(diff(n)))) %>% mutate(RRT="dropout")
+```
+
+
+```{r}
+reached_endpoint  %>% count(month,RRT) %>% rbind(select(dropouts,-cum_n)) %>% mutate(RRT = factor(RRT, levels = c( "CKD50",  "Tx","Dialysis", "dropout"))) %>% filter(month >0 & month <102) %>%
+  ggplot(aes(x=factor(month), y=log(n), fill=RRT)) + geom_bar(stat="identity", position = "dodge") +  theme_classic()+ theme(axis.text.x = element_text(angle = 0,hjust=1)) + ylab("log(number of patient)") + xlab("Months") +
+scale_fill_manual(values= c(CKD50="#A40000FF",Tx="#007E2FFF",Dialysis="#F3C558FF",dropout="#16317DFF"))
+#scale_fill_paletteer_d("PrettyCols::Lucent",name="") 
+#ggsave("~/Documents/4CStudy/Plots/reachedendpoint_overtime_logtransformed.pdf", width=8,height=5)
+```
+
+
+```{r}
+reached_endpoint %>%
+group_by(month, RRT) %>% 
+  summarise(n = n(), .groups = "drop") %>% # Count unique `patid` per group
+  complete(month, RRT, fill = list(n = 0)) %>% 
+  group_by(RRT) %>% 
+  mutate(cum_n = cumsum(n))%>% 
+ ungroup() %>% mutate(RRT = factor(RRT, levels = c( "CKD50",  "Tx","Dialysis", "dropout"))) %>%
+  arrange(month, RRT) %>%   rbind(dropouts) %>% filter(month > 0 & month < 102) %>%
+  ggplot(aes(x = factor(month), y = cum_n, fill = RRT)) + 
+  geom_col(position = position_dodge()) +theme_classic()+ theme(axis.text.x = element_text(angle = 45,hjust=1)) + xlab("Months") + ylab("log(Cummulative Number)")+ scale_y_log10(breaks=c(1,5,10,20,50,100,200,500))+
+ scale_fill_manual(values= c(CKD50="#A40000FF",Tx="#007E2FFF",Dialysis="#F3C558FF",dropout="#16317DFF"))
+#scale_fill_paletteer_d("PrettyCols::Lucent",name="")  # scale_fill_manual(values=c(  "#FA4616FF", "#003DA5FF","brown", "darkgreen"), name="")
+
+#ggsave("~/Documents/4CStudy/Plots/reachedendpoint_overtime_cummulative_logtransformed.pdf", width=6,height=3)
+
+```
+
+
+## 4. eGFR Longitudinal Description
+plotting the eGFR progression over time for the different groups: 50% egfr loss, on RRt , undergoing Tx, or dropout
+```{r}
+col<- c("#E01A4FFF","#F15946FF","#F9C22EFF","#53B3CBFF")
+
+egfr_progressdata<- investigation_file %>% filter(!is.na(egfr)) %>% select(patid, month, age_in_years_at_diadate, age_in_years_at_tpldate, age_in_years_at_vdate,egfr) %>% left_join(reached_endpoint %>% group_by(patid) %>% slice_min(month) %>% select(patid, month,  endpoint=RRT), by=c("month", "patid")) %>% group_by(patid) %>% # Group by patient ID
+  mutate(
+    has_endpoint = any(!is.na(endpoint)), # Check if the patient has an endpoint
+    endpoint_index = ifelse(has_endpoint, which(!is.na(endpoint))[1], NA) # Get the index of the first endpoint
+  ) %>%
+  filter(
+    is.na(endpoint_index) | row_number() <= endpoint_index # Keep rows before or at the first endpoint
+  ) %>%
+  select(-has_endpoint, -endpoint_index)  %>% # Remove helper columns 
+  mutate(endpoint=if_else(is.na(endpoint), "xnoep", endpoint)) %>% left_join(investigation_file %>% filter(month==0) %>% select(patid, BL_age=age_in_years_at_vdate), by="patid") %>%
+  mutate(age_RRT= case_when(endpoint=="Dialysis"~ age_in_years_at_diadate, endpoint=="Tx"~ age_in_years_at_tpldate, T~ age_in_years_at_vdate), age_diff=age_RRT-BL_age)
+```
+
+### splitted in groups
+
+```{r}
+gridExtra::grid.arrange(grobs=list(
+  egfr_progressdata %>% group_by(patid) %>% filter(any(endpoint=="Tx")) %>% ggplot(aes(x=age_diff, y=egfr)) + geom_point(aes(color=endpoint)) + geom_line(aes(group=patid), linetype="dashed", color="grey")  + theme_classic() +scale_color_manual(values= c("black", "#F15946FF"))+geom_smooth(se=F, color="#F15946FF") ,
+  
+   egfr_progressdata %>% group_by(patid) %>% filter(any(endpoint=="Dialysis")) %>% ggplot(aes(x=age_diff, y=egfr)) + geom_point(aes(color=endpoint)) + geom_line(aes(group=patid), linetype="dashed", color="grey")  + theme_classic() +scale_color_manual(values= c( "#F9C22EFF","black")) + geom_smooth(se=F, color="#F9C22EFF"),
+   
+   egfr_progressdata %>% group_by(patid) %>% filter(any(endpoint=="CKD50")) %>% ggplot(aes(x=age_diff, y=egfr)) + geom_point(aes(color=endpoint)) + geom_line(aes(group=patid), linetype="dashed", color="grey")  + theme_classic() +scale_color_manual(values= c( "#E01A4FFF","black")) +  geom_smooth(se=F, color="#E01A4FFF"),
+  
+   egfr_progressdata %>% group_by(patid) %>% filter(all(endpoint=="xnoep")) %>% mutate(endpoint=if_else(month==max(month), "lastep",endpoint)) %>% ggplot(aes(x=age_diff, y=egfr)) + geom_point(aes(color=endpoint)) + geom_line(aes(group=patid), linetype="dashed", color="grey")  + theme_classic() +scale_color_manual(values= c( "#53B3CBFF","black")) + geom_smooth(se=F, color="#53B3CBFF")
+
+  ))
+```
+
+### all together
+taken last eGFR before Tx
+```{r}
+egfr_progressdata %>% group_by(patid)  %>% filter(!any(month==0 & egfr >=60) )%>% mutate(endpoint= if_else(all(endpoint=="xnoep") & month==max(month), "lastep", endpoint))%>% 
+  mutate(ep2=case_when(any(endpoint=="Tx") ~"Tx", 
+                       any(endpoint=="Dialysis") ~"Dialysis",
+                       any(endpoint=="CKD50") ~ "CKD50",
+                       T ~ "lastep"
+                       )) %>% filter(!(ep2=="Tx" & month==max(month))) %>% mutate(endpoint=if_else(ep2=="Tx" & month==max(month) , "Tx",endpoint)) %>%
+
+
+  ggplot(aes(x=age_diff, y=egfr))   + theme_classic() + geom_line(aes(group=patid), linetype="dotted", color="darkgrey")+geom_point(aes(color=endpoint, alpha=endpoint)) +scale_color_manual( labels=c(xnoep="EP not reached", CKD50="50% eGFR loss", Dialysis="Dialysis", Tx="Transplantation", lastep="no endpoint reached\n(last reported eGFR)"), name="Endpoint", values= c(xnoep="grey",CKD50="#A40000FF",Tx="#007E2FFF",Dialysis="#F3C558FF",lastep="#16317DFF")) + ylab("eGFR")+  xlab("age difference to baseline in years") +  scale_alpha_manual( values = c( 1, 1, 1,1,0.3)) + guides(alpha=F)
+```

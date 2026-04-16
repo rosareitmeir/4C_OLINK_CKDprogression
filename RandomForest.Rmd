@@ -1,0 +1,468 @@
+---
+title: "Random Forest"
+output: html_document
+date: "2025-03-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(readxl)
+library(paletteer)
+library(randomForest)
+library(tibble)
+library(mlr)
+library(stringr)
+library(plotROC)
+library(caret)
+```
+
+Random Forest for predicting whether patient reaches ckd endpoint (50% loss or RRT) within xx months 
+time frames every annual visit from 1 year up to 8 years, taking out drop outs, only consider the ones that have reached endpoint till this time point or did not reached endpoint and did not drop out 
+
+## Data Input
+
+```{r data input}
+### baseline table: contains all clinical variables at month 0 for each patient 
+BL_data_bpoffice <-read.csv("~/Projects/4cstudy/Tables/BL_data_bpoffice.csv",  sep = ",",header=T) #%>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))
+
+### investigation file from ckd progression, clinical data from all visits month 0 -120 
+investigation_file <-read.csv("~/Projects/4cstudy/Tables/investigation_file.csv",  sep = ",",header=T) %>% filter(!is.na(month) & month!="FALSE")%>% mutate(across(everything(), ~ type.convert(.x, as.is = TRUE)))
+
+### from ckd progression 
+# contains the first month where the patient reached one of the endpoints: ckd50%, tx, dialysis
+reached_endpoint <- read.csv("~/Projects/4cstudy/Tables/reached_endpoint.csv", sep = ",", header=T) 
+
+### olink data
+olink_data <- read.csv("~/Projects/4cstudy/Tables/OLINK_data.csv",  sep = ",",header=T) %>% arrange(pat_id) %>% rename(patid=pat_id) 
+
+### labels
+protein_labels_df<- read_excel("~/Projects/4cstudy/ClinicalData/analyte_abbrev_HB.xlsx")
+```
+
+### Prepare Data 
+
+#### clinical data 
+clinical variables at study entrance as predictors 
+```{r}
+####### subsetting ################ 
+## subset to variables of interest (same as the one tested via metadeconfoundr), change to binary variables, no characters 
+## get rid of patient without egfr at baseline 
+pat_withoutegfr <- (BL_data_bpoffice %>% arrange(patid) %>% filter(is.na(egfr)))$patid
+RF_clinicaldata <-  BL_data_bpoffice %>% arrange(patid) %>% filter(!is.na(egfr)) %>% select(egfr, age,sex,bmisds,alburie,bicar,hb,phos,salb,diasds,syssds,syssds_above2,diasds_above2, hyper_class,diagnose2, country, patid) %>% mutate(hyper_class=if_else(hyper_class=="yes",1,0)) %>%  mutate(sex_male=if_else(sex=="male",1,0),.keep = "unused", .before = 1 ) %>% fastDummies::dummy_columns(. ,select_columns = c("diagnose2")) %>% select(-diagnose2) %>% relocate(patid)
+
+########### Imputation ########### 
+## variables with missing values 
+colnames(RF_clinicaldata)[ apply(RF_clinicaldata, 2, anyNA) ]
+## impute median if missing 
+RF_clinicaldata<- impute(RF_clinicaldata %>% dplyr::select(where(is.numeric)), classes=list(numeric=imputeMedian()))$data %>% mutate(syssds_above2=if_else(is.na(syssds_above2),0,syssds_above2),diasds_above2=if_else(is.na(diasds_above2),0,diasds_above2))
+####### Labelling ############ 
+## KFRE (kidney failure risk equation) variables 
+RF_clinicaldata <- RF_clinicaldata %>% relocate(patid, age,sex_male,egfr,alburie)
+
+names(RF_clinicaldata)[2:5] <- paste0("KFRE_", names(RF_clinicaldata)[2:5])
+
+### all others 
+names(RF_clinicaldata)[6:ncol(RF_clinicaldata)] <- paste0("clinical_", names(RF_clinicaldata)[6:ncol(RF_clinicaldata)])
+
+RF_clinicaldata
+```
+
+#### olink data
+protein npx values at study entrance also as predictors 
+
+```{r}
+####### subsetting ########
+## taken the imputated olink data based on the raw scale 
+RF_olinkdata <- olink_data  %>% select(patid, starts_with("rawscale")) %>% filter(patid %in% BL_data_bpoffice$patid)
+
+#### labelling them as "native" measured protein levels
+names(RF_olinkdata) <- str_replace(names(RF_olinkdata), "rawscale_", "native_")
+
+######### adjusted protein levels ############
+## egfr corrected protein levels  -> residuals of the lm analyte ~ egfr 
+
+corrected_proteins <- sapply(names(RF_olinkdata %>% select(starts_with("native"))), function(x){
+ form <- formula(paste(x, "~ KFRE_egfr"))
+ model <- lm(form, data= left_join(RF_clinicaldata , RF_olinkdata %>% select(patid, {{x}}) ,by="patid" ))
+ return(residuals(model))
+}) %>% as.data.frame() %>% mutate(patid = RF_clinicaldata$patid) %>% relocate(patid)
+
+names(corrected_proteins) <- str_replace(names(corrected_proteins),"native_", "corrected_")
+
+RF_olinkdata <- RF_olinkdata %>% left_join(corrected_proteins, by="patid")
+RF_olinkdata<- RF_olinkdata %>% mutate(across(everything(), as.numeric))
+```
+
+#### together
+```{r}
+RF_alldata <- full_join(RF_clinicaldata, RF_olinkdata, by="patid") 
+```
+
+## Random Forest Functions
+function called within kcv execution function, construct the random forest with a 5 fold cross validation
+```{r}
+construct_kcv_model <- function(data){
+   # k folds settings
+      train_control <- trainControl(
+      method = "cv",                # Use k-fold cross-validation
+      number = 5,                   # Number of folds
+      classProbs = TRUE,            # Compute probabilities
+      summaryFunction = twoClassSummary, # For ROC, sensitivity, etc.
+      savePredictions = "final"     # Save predictions for all folds
+    )
+
+    # Train a Random Forest model
+    set.seed(123)
+    rf_model <- train(
+      reachedep ~ .,                  # Formula
+      data = data,                  # Data
+      method = "rf",                # Use Random Forest
+      trControl = train_control,    # Cross-validation settings
+      metric = "ROC",               # Optimize for AUC (ROC)
+      tuneGRid=expand.grid(mytry=5) # Automatically tune hyperparameters
+    )
+  
+    return(rf_model)
+}
+```
+
+main function:
+
+- subsets the patients for the time frame (drop outs out)
+- split data in train and test
+- class weights for imbalance 
+- if desired, then a subset of proteins is given to construct a random forest
+- random: taken a random subset of proteins to construc a random forest ( check whether those proteins are really a good fit or just by luck)
+```{r}
+run_kcrossvalidation <- function(m,data, investigation_file,reached_endpoint, subsetlist=NULL,subsetRF=NULL, random=F, split=0.8){
+
+############# define endpoint for xx time frame 
+  ## all patients that reach ep at month m or before
+  patient_reachep<- reached_endpoint %>% filter(month <= m)%>% distinct(patid) %>% pull(patid) 
+  ## get patients that have an entry for month xx  
+  pat_with_visit <- investigation_file  %>% filter(month== as.numeric(m)) %>% distinct(patid) %>% pull(patid)
+  
+  ## subset to patients that are still enrolled in study at month xx or reach ep latest at month xx
+  data <- data %>% filter(patid %in% pat_with_visit | patid %in% patient_reachep) 
+  
+  ### add class reached endpoint within xx months
+  data <- data %>% mutate(reachedep= as.factor(if_else(patid %in% patient_reachep,"yes","no")) )
+  
+  print(paste0( "number patients: ", nrow(data), "distrib: ", paste(table(data$reachedep),collapse = " ")))
+  
+############### split data
+  set.seed(123)
+  ind <- sample(2, nrow(data ), replace = TRUE, prob = c(split, 1-split))
+  train_data <- data[ind==1,]
+  test_data <-data[ind==2,]
+  
+################## calculate class weights
+  train_samplesizes <- table(train_data$reachedep)
+  class_weights <- c( train_samplesizes[1]/sum(train_samplesizes), train_samplesizes[2]/sum(train_samplesizes) )
+
+  proteins <- str_remove(names(train_data %>% select(starts_with("native"))), "native_" )
+
+############ get protein subset of interest
+  if(!is.null(subsetlist)){
+    if(is.list(subsetlist)){
+      ## either using sig. associated proteins for this specific month
+    subsetproteins <- subsetlist[[paste0("reachedep", m, "m")]]}
+    else{
+      ### or use a fixed subset 
+      subsetproteins <- subsetlist
+    }
+    KFRE_subsetnative_RF <- construct_kcv_model( data= train_data %>% select(reachedep,starts_with("KFRE"), paste0("native_", subsetproteins)))
+     print("done")
+    #### KFRE + corrected olink proteins
+    KFRE_subsetcorrected_RF <- construct_kcv_model(data=train_data %>% select(reachedep,starts_with("KFRE"), paste0("corrected_", subsetproteins)))
+    
+    if (random){
+    set.seed(123)
+
+    randomsubset <- sample(proteins, size=length(subsetproteins), replace=F)
+    
+    KFRE_RANDOMsubsetnative_RF <- construct_kcv_model( data= train_data %>% select(reachedep,starts_with("KFRE"), paste0("native_", randomsubset)))
+    
+    KFRE_RANDOMsubsetcorrected_RF <- construct_kcv_model(data=train_data %>% select(reachedep,starts_with("KFRE"), paste0("corrected_", randomsubset)))
+    
+    }
+  }
+
+   
+#################### construct k-cv RF for the different selected predictor sets
+    #### KFRE variables alone
+    KFRE_RF <- construct_kcv_model( data=train_data %>% select(reachedep,starts_with("KFRE")))
+
+    #### KFRE + native olink proteins + clinical variables
+   KFRE_all_RF <- construct_kcv_model( data= train_data %>% select(reachedep,starts_with("KFRE"), starts_with("clinical"), paste0("native_", proteins)))
+
+    ####  olink proteins
+    protein_RF <- construct_kcv_model(data=train_data %>% select(reachedep,paste0("native_", proteins)))
+
+    #### clinical variables
+  clinical_RF <- construct_kcv_model(data=train_data %>% select(reachedep, starts_with("clinical")))
+
+     ### KFRE + proteins
+    KFRE_protein_RF <- construct_kcv_model( data= train_data %>% select(reachedep,starts_with("KFRE"), paste0("native_", proteins)))
+     
+    ### proteins + clinical variables 
+      protein_clinical_RF <- construct_kcv_model( data= train_data %>% select(reachedep,starts_with("clinical"), paste0("native_", proteins)))
+ 
+   RFlist <- list(KFRE_RF= KFRE_RF, 
+                all_RF=KFRE_all_RF,
+                 protein_RF=protein_RF,
+                 clinical_RF=clinical_RF,
+                 KFRE_protein_RF=KFRE_protein_RF,
+               protein_clinical_RF=protein_clinical_RF)
+   
+#### if protein subset is set then different RFs
+   if(!is.null(subsetlist)){
+     RFlist <- list(KFRE_RF= KFRE_RF, 
+                KFRE_clinical_RF=KFRE_clinical_RF,
+                 KFRE_corrected_RF=KFRE_corrected_RF,
+                 KFRE_native_RF=KFRE_native_RF,
+                KFRE_correctsub_RF= KFRE_subsetcorrected_RF,
+                KFRE_nativesub_RF=  KFRE_subsetnative_RF)
+   
+   }
+ 
+### options: checking result of a random subset   
+   if(random){
+     RFlist <- list(KFRE_RF= KFRE_RF, 
+                KFRE_clinical_RF=KFRE_clinical_RF,
+                 KFRE_RANDOMsubsetcorrected_RF=KFRE_RANDOMsubsetcorrected_RF,
+                KFRE_RANDOMsubsetnative_RF=KFRE_RANDOMsubsetnative_RF,
+                KFRE_correctsub_RF= KFRE_subsetcorrected_RF,
+                KFRE_nativesub_RF=  KFRE_subsetnative_RF)
+   }
+   
+################# summary results
+   
+  ##### variance importance ######### 
+  varImp_df <- bind_rows(lapply(names(RFlist), function(model_name) {
+  get_varImp(RFlist[[model_name]], model_name)
+}))
+  # Reorder columns for better readability
+varImp_df <- varImp_df %>%
+  select(Model, Variable, everything()) %>% mutate(month=m)
+
+  ############# validation ########### 
+  ### roc curve
+  plot <- plot_ROCcurve(RFlist,test_data, kcv=T,color=c("red", "purple", "lightblue", "blue","lightgreen", "darkgreen")) 
+  ## add labels
+  plot <- plot +  labs(title= paste0("Endpoint reached in ", m, " m"), 
+       subtitle = paste(names(table(data$reachedep)), table(data$reachedep), sep=":", collapse = " "))
+  
+  ### subset of RFs
+  #c("KFRE_RF","all_RF","protein_RF")
+  subset_plot <- plot_ROCcurve(RFlist,test_data, kcv=T,color=c("red", "purple", "lightblue"), subset=subsetRF) 
+  ## add labels
+  subset_plot <- subset_plot +  labs(title= paste0("Endpoint reached in ", m, " m"), 
+       subtitle = paste(names(table(data$reachedep)), table(data$reachedep), sep=":", collapse = " "))
+  
+  
+  ### metric: sensitivity, specificty,... 
+  table <- generate_metrictable(RFlist, test_data, "reachedep") %>% mutate(month=m)
+  
+### return the results
+  return(list(plot,table,varImp_df,subset_plot))
+}
+```
+
+
+```{r}
+## whether it is a kcv RF (different obj, needed to access the names)
+plot_ROCcurve<- function(RFlist, test_data, subset=NULL, color=c("red", "purple", "lightblue", "blue","darkgreen"),kcv=F){
+  
+   alldata <- test_data %>% select(reachedep)
+
+  ## for each RF predict the outcome for the test-data
+  for (i in 1: length(RFlist)){
+    name <- names(RFlist)[i]
+    RF <- RFlist[[i]]
+    if (!kcv){
+    predict <-  predict(RF, test_data%>% select(rownames(RF$importance)), "prob")[,2]}
+    else{
+      predict <- predict(RF, test_data, "prob")[,2]
+    }
+    
+    alldata[[name]] <- predict
+  }
+   
+   ### data frame with true outcome, predicted outcome (value) for each sample and RFs
+  alldata <- alldata %>% gather("RF", "value", -reachedep) %>% mutate(RF=factor(RF, levels= names(RFlist))) %>% mutate(reachedep=ifelse(reachedep=="yes" | reachedep==1 ,1,0))
+  
+  ### plotting not all RFs, just a subset
+  if(!is.null(subset)){
+    alldata <- alldata %>% filter(RF %in% subset)
+  }
+  
+  ## plotting
+  basicplot <- alldata %>% ggplot(aes(d=reachedep, m=value,color=RF)) + geom_roc(increasing=T, n.cuts=0) + style_roc() 
+ ### add AUC numbers
+ basicplot<- basicplot  +  scale_color_manual(labels=paste( names(RFlist), "(AUC =", round(calc_auc(basicplot)$AUC, 2),")" ),values=color)
+ return(basicplot)
+  
+}
+
+
+```
+```{r}
+get_varImp <- function(RF, model_name) {
+  imp <- varImp(RF)$importance  # Extract importance values
+  imp <- imp %>%
+    rownames_to_column(var = "Variable") %>%  # Convert rownames to a column
+    mutate(Model = model_name)  # Add model name
+  return(imp)
+}
+```
+
+
+```{r}
+generate_metrictable <- function(RFlist, test_data, endpoint) {
+  # Create an empty list to store metrics for each model
+  metrics_list <- list()
+  
+  # Iterate through the random forests in the list
+  for (i in 1:length(RFlist)) {
+    model_name <- names(RFlist)[i]
+    RF <- RFlist[[i]]  # Access the random forest object
+    
+    # Get predictions (assumes binary classification)
+    predictions <- predict(RF, test_data, type = "raw")
+    probs <- predict(RF,test_data, type = "prob")[, 2]
+    
+    # Compute the confusion matrix
+    cm <- confusionMatrix(predictions, test_data[[endpoint]], positive = "yes")
+    
+    # Extract metrics
+    sensitivity <- cm$byClass["Sensitivity"]
+    specificity <- cm$byClass["Specificity"]
+    accuracy <- cm$overall["Accuracy"]
+    precision <- cm$byClass["Precision"]
+    f_measure <- cm$byClass["F1"]
+    
+    # Store metrics in a data frame
+    metrics_list[[model_name]] <- data.frame(
+      Model = model_name,
+      Sensitivity = sensitivity,
+      Specificity = specificity,
+      Accuracy = accuracy,
+      Precision = precision,
+      F_Measure = f_measure
+    )
+  }
+  
+  # Combine metrics from all models into a single table
+  metrics_table <- bind_rows(metrics_list)
+  rownames(metrics_table) <- NULL
+  return(metrics_table)
+}
+```
+
+## Execution
+run the main function in a loop, constructing random forest for a month for each time frame 
+constructing three different RFs: only KFRE variables, only protein profiles, and all variables (KFRE, proteins, other clinical features)
+```{r}
+metriclist <- list()
+varimplist <- list()
+plotlist <- list()
+subplotlist <- list()
+for (i in 1:8){
+  list <- run_kcrossvalidation(m=12*i,
+                               data=RF_alldata,
+                               investigation_file = investigation_file, 
+                               reached_endpoint = reached_endpoint, 
+                               subsetRF = c("KFRE_RF","all_RF","protein_RF") )
+  plotlist[[i]] <- list[[1]]
+  metriclist[[i]] <-list[[2]]
+  varimplist[[i]] <- list[[3]]
+  subplotlist[[i]] <- list[[4]]
+}
+## plot all ROC curves
+gridExtra::grid.arrange(grobs=subplotlist)
+## one big metric table
+metrictable <- bind_rows(metriclist)
+```
+
+
+## Visualization
+###  Top 10 Variables
+plotting the top 10 variables for each random forest for the endpoint 24 and 36 
+```{r}
+varimptable <- bind_rows(varimplist)
+varimptable <- varimptable %>%  mutate(Variable = sub("^[^_]+_", "", Variable))
+varimp_plotlist <- list()
+for (i in 1:6){
+model <- unique(varimptable$Model)[i]
+p <-  varimptable  %>% filter((month==24 | month==36) & Model==model) %>%
+  group_by(month) %>% top_n(10,Overall) %>%
+  left_join(protein_labels_df %>% rename(Variable = analyte), by = "Variable") %>%
+  mutate( name = ifelse(is.na(name), Variable, name))%>% 
+  ggplot(aes(x=Overall, y=reorder(name,Overall), fill=as.character(month))) + geom_bar(stat="identity" , position="dodge") + scale_fill_manual(values = c("24"="#9F4F84", "36"="#66A64D"), name="Endpoint reached within month") + theme_classic() + xlab("Mean Decrease Accuracy") +ylab("") + ggtitle(model) + theme(legend.position = "none")
+
+if(i==1){
+  p <- p + theme(legend.position = "top")
+}
+
+varimp_plotlist[[i]] <- p
+}
+
+gridExtra::grid.arrange(grobs=varimp_plotlist)
+```
+
+### Top 20 heatmap
+top 20 variables for all time points for the RF with all variables (KFRE, clinical and proteins)
+```{r}
+varimptable %>%
+  left_join(protein_labels_df %>% rename(Variable = analyte), by = "Variable") %>%
+  mutate(type = ifelse(is.na(name), "clinic", "protein"),
+         name = ifelse(is.na(name), Variable, name)) %>%
+  filter(Model == "all_RF") %>%
+  group_by(month) %>%
+  top_n(20, Overall) %>%
+  ungroup() %>%
+  mutate(type = factor(type, levels = c( "protein","clinic"))) %>%  # Clinic first
+  group_by(name) %>%
+  mutate(n_months = n_distinct(month), meanoverall=mean(Overall)) %>%  # Count unique months per variable
+  ungroup() %>%# group_by(type)%>%
+  arrange(-desc(n_months),-desc(meanoverall)) %>%  # Sort by type, then Overall, then frequency
+  mutate(name = factor(name, levels = unique(name))) %>%  # Keep order
+  ggplot(aes(fill = Overall, y = name, x = as.factor(month))) + 
+  geom_tile() + 
+  theme_minimal() + 
+  ylab("") + 
+  scale_fill_viridis_c(direction = -1, name = "Mean Decrease\nAccuracy") + xlab("Month")
+```
+
+
+### Metric Plot
+
+```{r}
+metrictable <- bind_rows(metriclist) %>% filter(Model %in% c("KFRE_RF","all_RF","protein_RF"))
+write.table(metrictable %>% rename(RF_model=Model), "~/Projects/4cstudy/Plots/Figure3/RF_final/RF_metrics_table_050326.tsv", row.names=F, quote=F,na="NA", sep="\t")
+
+```
+
+bar plot showing senitidy, specificty, accuarcy, fmeasure for the four RFs and for the time points 24,36,48 months
+```{r}
+models<-c("KFRE_RF", "all_RF", "protein_RF", "KFRE_protein_RF")
+colors<- c(KFRE_RF="red", all_RF="purple", protein_RF="lightblue", KFRE_protein_RF="lightgreen")
+metrictable <- bind_rows(metriclist)
+metricplot<- gridExtra::grid.arrange(grobs=list(
+  metrictable %>% filter(Model %in% models & month >12 & month <= 48) %>% mutate(Model=factor(Model, levels=metrictable$Model[1:6])) %>% ggplot(aes(x=as.character(month), y=Sensitivity, fill=Model)) + geom_bar(stat="identity", width=0.4, position = position_dodge(width=0.7))  + scale_fill_manual(values = colors,name="")+ theme_classic() + ylim(0,1)+ theme(legend.position = "top", legend.text = element_text(size=7))  + xlab(""),
+
+  metrictable%>% filter(Model %in% models & month >12 & month <= 48)   %>% mutate(Model=factor(Model, levels=metrictable$Model[1:6])) %>% ggplot(aes(x=as.character(month), y=Specificity, fill=Model)) + geom_bar(stat="identity", width=0.4, position = position_dodge(width=0.7))  + scale_fill_manual(values = colors) + theme_classic()+ ylim(0,1) + xlab("")+ theme(legend.position = "none") ,
+
+   metrictable%>% filter(Model %in% models & month >12 & month <= 48)  %>% mutate(Model=factor(Model, levels=metrictable$Model[1:6])) %>% ggplot(aes(x=as.character(month), y=Accuracy, fill=Model)) + geom_bar(stat="identity", width=0.4, position = position_dodge(width=0.7))  + scale_fill_manual(values = colors) + theme_classic() + ylim(0,1)+ theme(legend.position = "none") + xlab(""),
+  
+   metrictable%>% filter(Model %in% models & month >12 & month <= 48)  %>% mutate(Model=factor(Model, levels=metrictable$Model[1:6])) %>% ggplot(aes(x=as.character(month), y=F_Measure, fill=Model)) + geom_bar(stat="identity", width=0.4, position = position_dodge(width=0.7))  + scale_fill_manual(values = colors) + theme_classic() + xlab("") + ylim(0,1)+ theme(legend.position = "none") ,
+
+   metrictable%>% filter(Model %in% models & month >12 & month <= 48)  %>% mutate(Model=factor(Model, levels=metrictable$Model[1:6])) %>% ggplot(aes(x=as.character(month), y=Precision, fill=Model)) + geom_bar(stat="identity", width=0.4, position = position_dodge(width=0.7))  + scale_fill_manual(values = colors) + ylim(0,1) +theme_classic()  + xlab("Months at which endpoint is reached")+ theme(legend.position = "none") ),ncol=1, heights=c(1.55,1,1,1,1))
+```
