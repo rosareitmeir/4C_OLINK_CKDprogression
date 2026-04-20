@@ -13,6 +13,8 @@ library(tibble)
 library(ggpubr)
 library(readxl)
 library(paletteer)
+library(stringr)
+library(forcats)
 ```
 
 ## 0. Read files 
@@ -423,4 +425,40 @@ have a look on whether those proteins are missing more or less in certain ckd st
 ```{r}
 critical_analytes_absent_df %>% rename(patid=pat_id) %>% left_join(BL_data_bpoffice,.,by="patid") %>% group_by(ckd1) %>%   summarise(across(analytes_tobetested, ~sum(.x, na.rm = TRUE)/n())) %>% ungroup() %>% gather(-ckd1,key="protein", value="value" ) %>% 
   ggplot(aes(x=protein,fill=ckd1, y=value)) + geom_bar(stat="identity", position="dodge") + theme_classic() +   scale_fill_paletteer_d("PrettyCols::Bold", name="CKD stage") + ylab("Percentage of missing meausrements") + xlab("")
+```
+
+
+## 6 Protein Sizes
+does protein sizes/weights and loading correlate with the measured levels?
+
+```{r}
+protein_info <- read_xlsx("~/Projects/4cstudy/Tables/OLINKsizecharge_edited.xlsx") %>% rename(name=Gene, size=`Size [kDa]`)
+
+size_olinklevels <- olink_data %>% select(starts_with("raw"))
+names(size_olinklevels)<- str_remove(names(size_olinklevels),"rawscale_")
+size_olinklevels <-size_olinklevels  %>%pivot_longer(
+    cols = everything(),        
+    names_to = "analyte",
+    values_to = "level"
+  ) %>% left_join(read_excel("~/Projects/4cstudy/ClinicalData/analyte_abbrev_HB.xlsx") %>% mutate(name=if_else( name!="Axin-1",str_remove(name,"-"),"AXIN1")  ),by="analyte") %>% left_join(protein_info,by="name")
+
+```
+
+### correlation olink levels and protein size and charge
+
+```{r}
+size_olinklevels %>% ggplot(aes(x=fct_reorder(name,size), y=level)) + geom_boxplot() + theme_classic()
+size_olinklevels %>% ggplot(aes(x=fct_reorder(name,Charge), y=level)) + geom_boxplot() + theme_classic()
+
+size_olinklevels %>% group_by(name) %>% summarise(median=median(level),size,Charge) %>% distinct() %>% ggplot(aes(x=Charge, y=median,color=log(size))) + geom_point() + theme_classic() + scale_color_viridis_c() + geom_smooth()
+
+### plot for supplement: correlations of size/charge to npx values of the protein 
+cor(size_olinklevels %>% group_by(name) %>% summarise(median=median(level)) %>%pull(median), unique(size_olinklevels %>% arrange(name) %>% pull(size)), method="spearman")
+
+#### charge
+p1<- size_olinklevels %>% group_by(name,size,Charge) %>% summarise(median=median(level)) %>% distinct() %>% ggplot(aes(x=Charge, y=median)) + geom_point(aes(color=log(size))) + theme_classic() + scale_color_viridis_c() + geom_smooth(method="lm") + stat_cor(method="spearman")
+#### size
+p2<- size_olinklevels %>% group_by(name) %>% summarise(median=median(level),size,Charge) %>% distinct() %>% ggplot(aes(x=size, y=median)) + geom_point(aes(color=Charge)) + theme_classic()  + scale_color_viridis_c() + geom_smooth(method="lm") + stat_cor(method="spearman")
+
+ggarrange(p1,p2)
 ```
