@@ -14,7 +14,6 @@ library(ggpubr)
 library(readxl)
 library(paletteer)
 library(stringr)
-library(forcats)
 ```
 
 ## 0. Read files 
@@ -430,6 +429,7 @@ critical_analytes_absent_df %>% rename(patid=pat_id) %>% left_join(BL_data_bpoff
 
 ## 6 Protein Sizes
 does protein sizes/weights and loading correlate with the measured levels?
+and are higher ckd stages and proteinurie stages associated with protein sizes/loading 
 
 ```{r}
 protein_info <- read_xlsx("~/Projects/4cstudy/Tables/OLINKsizecharge_edited.xlsx") %>% rename(name=Gene, size=`Size [kDa]`)
@@ -442,23 +442,134 @@ size_olinklevels <-size_olinklevels  %>%pivot_longer(
     values_to = "level"
   ) %>% left_join(read_excel("~/Projects/4cstudy/ClinicalData/analyte_abbrev_HB.xlsx") %>% mutate(name=if_else( name!="Axin-1",str_remove(name,"-"),"AXIN1")  ),by="analyte") %>% left_join(protein_info,by="name")
 
+
+#write.table( read_excel("C:/Users/rosa/Documents/4CStudy/ClinicalData/analyte_abbrev_HB.xlsx") %>% mutate(name=if_else( name!="Axin-1",str_remove(name,"-"),"AXIN1")  ) %>% left_join(protein_info,by="name"),"C:/Users/rosa/Documents/4CStudy/Tables/OLINKsizecharge_RR.tsv", row.names=F, quote=F,na="NA", sep="\t")
 ```
 
 ### correlation olink levels and protein size and charge
 
 ```{r}
+library(forcats)
 size_olinklevels %>% ggplot(aes(x=fct_reorder(name,size), y=level)) + geom_boxplot() + theme_classic()
 size_olinklevels %>% ggplot(aes(x=fct_reorder(name,Charge), y=level)) + geom_boxplot() + theme_classic()
 
 size_olinklevels %>% group_by(name) %>% summarise(median=median(level),size,Charge) %>% distinct() %>% ggplot(aes(x=Charge, y=median,color=log(size))) + geom_point() + theme_classic() + scale_color_viridis_c() + geom_smooth()
 
-### plot for supplement: correlations of size/charge to npx values of the protein 
+
 cor(size_olinklevels %>% group_by(name) %>% summarise(median=median(level)) %>%pull(median), unique(size_olinklevels %>% arrange(name) %>% pull(size)), method="spearman")
 
-#### charge
 p1<- size_olinklevels %>% group_by(name,size,Charge) %>% summarise(median=median(level)) %>% distinct() %>% ggplot(aes(x=Charge, y=median)) + geom_point(aes(color=log(size))) + theme_classic() + scale_color_viridis_c() + geom_smooth(method="lm") + stat_cor(method="spearman")
-#### size
+
 p2<- size_olinklevels %>% group_by(name) %>% summarise(median=median(level),size,Charge) %>% distinct() %>% ggplot(aes(x=size, y=median)) + geom_point(aes(color=Charge)) + theme_classic()  + scale_color_viridis_c() + geom_smooth(method="lm") + stat_cor(method="spearman")
 
 ggarrange(p1,p2)
+```
+### correlation egfr and protein size/charge
+
+taken beta estimates of the linear models ( analyte ~ egfr)
+correlating those with size and charge of the proteins
+```{r}
+betaestimates <- read.csv("~/Projects/4cstudy/Tables/estimates_lm_rawegfr_scaledanalytes.tsv", na="NA", sep="\t") %>% left_join(labels,.,by="analyte")
+```
+
+
+```{r}
+p1<- protein_info %>%inner_join(betaestimates %>% mutate(significant= FDR<0.05) %>% select(name,estimate,significant) ,by="name") %>% 
+  ggplot(aes(x=log(size),y=estimate)) + geom_point(aes(color=significant)) +
+  stat_cor(method="spearman") +
+  geom_smooth(method="lm") + 
+  theme_classic() +
+  theme(legend.position="top")+ 
+  scale_color_manual(values=c("black", "red"))
+
+p2<- protein_info %>%inner_join(betaestimates %>% mutate(significant= FDR<0.05) %>% select(name,estimate,significant) ,by="name") %>% 
+  ggplot(aes(x=Charge,y=estimate)) + geom_point(aes(color=significant)) +
+  stat_cor(method="spearman") +
+  geom_smooth(method="lm") + 
+  theme_classic() +
+  theme(legend.position="top")+ 
+  scale_color_manual(values=c("black", "red"))
+
+gridExtra::grid.arrange(p1,p2,nrow=1)
+```
+
+### alburie association
+```{r}
+## function from cca rmd file 
+run_coefficient2 <- function(data, predictors, start, end, scale = TRUE) {
+  res_list <- list()  # Store results
+  
+  for (i in start:end) {
+    y <- data.matrix(data[, i])
+    analyte <- names(data)[i]
+    
+    if(scale){
+       lm=(lm(scale(analyte)~.,predictors %>% mutate(analyte=y)))
+    }
+    else{
+       lm=(lm(analyte~.,predictors %>% mutate(analyte=y)))
+    }
+    
+    fit <- summary(lm)
+   # confints <- data.frame(confint(lm_model)) %>% tibble::rownames_to_column("predictor")
+    
+    # Extract results for all predictors
+    predictors_list <- rownames(fit$coefficients)
+    print(predictors_list)
+    print(rep(analyte, length(predictors_list)))
+    results <- data.frame(
+      analyte = rep(analyte, length(predictors_list)-1),
+      predictor = predictors_list[-1],
+     # adjRsqr = fit$adj.r.squared,
+    #  p_valRsqr = pf(fit$fstatistic[1], fit$fstatistic[2], fit$fstatistic[3], lower.tail = FALSE),
+     pval = fit$coefficients[-1, 4],
+      estimate = fit$coefficients[-1, 1]
+    #  lower_CI = confints[, 2],
+     # upper_CI = confints[, 3]
+    )
+    
+    res_list[[i]] <- results
+  }
+  
+  res <- do.call(rbind, res_list)  # Combine all results
+  
+  # Apply FDR correction across all p-values
+  res$FDR <- p.adjust(as.numeric(res$pval), method = "fdr")
+  
+  return(res)
+}
+```
+
+calculating beta estimates for UACR , same procedure as for eGFR
+```{r}
+pat_withoutegfr <- xx
+
+alburie_estimates<- run_coefficient2(data = olink_data%>% filter(pat_id != pat_withoutegfr) %>% arrange(pat_id), 
+               predictors =  BL_data_bpoffice %>%mutate(alburie=log(as.numeric(alburie)+0.01)) %>% dplyr::select(alburie) , 82,158) %>%mutate( analyte=str_replace(analyte,"^rawscale_",""))
+
+
+alburie_estimates <- alburie_estimates  %>% left_join(labels,.,by="analyte")
+
+alburie_estimates %>% filter(FDR <0.05)
+
+```
+
+```{r}
+p1<- protein_info %>%inner_join(alburie_estimates %>% mutate(significant= FDR<0.05) %>% select(name,estimate,significant) ,by="name") %>% 
+  ggplot(aes(x=log(size),y=estimate)) + geom_point(aes(color=significant)) +
+  stat_cor(method="spearman") +
+  geom_smooth(method="lm") + 
+  theme_classic() +
+  theme(legend.position="top")+ 
+  scale_color_manual(values=c("black", "red"))
+
+p2<- protein_info %>%inner_join(alburie_estimates %>% mutate(significant= FDR<0.05) %>% select(name,estimate,significant) ,by="name") %>% 
+  ggplot(aes(x=Charge,y=estimate)) + geom_point(aes(color=significant)) +
+  stat_cor(method="spearman") +
+  geom_smooth(method="lm") + 
+  theme_classic() +
+  theme(legend.position="top")+ 
+  scale_color_manual(values=c("black", "red"))
+
+gridExtra::grid.arrange(p1,p2,nrow=1)
 ```
