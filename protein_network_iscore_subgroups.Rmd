@@ -349,45 +349,138 @@ edge_df <- data.frame(
   og_weight=pcor_mat[edges],
   fdr    = fdr_mat[edges]
 ) %>% dplyr::filter(fdr < 0.05)
+```
 
+```{r}
+
+Chemokines<-c(
+ "CCL7", "CCL2", "CXCL11", "CXCL9", "CXCL1", "CCL4",
+"CCL13", "CCL11", "CCL19", "CXCL5", "CCL23", "CCL3",
+"CXCL6", "CXCL10", "CCL28", "CCL8", "CCL25", "CX3CL1", "CCL20"
+  )
+TNF_superfamily<-c(
+"TRAIL", "TNFSF10", "TNFSF14", "TNFSF11", "TNF","TNFB", "TNFRSF9","TNFSF11", 
+"TNFSF12","TWEAK", "LTA", "TNFRSF11B","OPG", "TRANCE","RANKL"
+  )
+Interleukins_and_receptors<-c(
+"IL7" ,"IL8", "IL6", "IL17C", "IL17A", "IL20RA", "IL18",
+"IL10RA", "IL15RA", "IL10RB", "IL18R1", "IL12B", "IL10", "OSM","LIFR","IFNGAMMA"
+  )
+Growth_factors<-c(
+"VEGFA", "GDNF", "TGFB1", "KITLG","SCF", "TGFA","TGFALPHA", "FGF23",
+"FGF5", "FGF21", "HGF", "FGF19", "CSF1", "FLT3LG", "NTF3","NT3","LAPTGF_BETA_1"
+  )
+Immune_costimulation_checkpoint<-c(
+"CD274","PDL1", "CD40", "CD244", "CD5", "CD6", "CD8A",	"CDCP1", "SLAMF1"
+  )
+
+other <- c("UPA"  ,  "AXIN1" , "CST5"  , "MMP1" ,   "MMP10"  ,"X4EBP1", "SIRT2",  "DNER" ,  "ENRAGE", "CASP8" ,"ST1A1",  "STAMBP", "ADA" )
+
+```
+
+```{r}
 node_df <- data.frame(
-  name = colnames(pcor_mat),
-  group = ifelse(colnames(pcor_mat) %in% c("CD40","PD-L1","CX3CL1","CD137"),
-                 "Target", "Other")
-)
+  name = colnames(pcor_mat)) %>% left_join(labels) %>% mutate(analyte= str_remove( str_to_upper(analyte),"_")) %>% 
+  mutate( group = case_when(name %in% Chemokines | analyte %in% Chemokines ~"Chemokines",
+                     name %in% TNF_superfamily | analyte %in% TNF_superfamily ~"TNF superfamily",
+                    name%in% Interleukins_and_receptors | analyte %in% Interleukins_and_receptors ~ "Interleukins and receptors",
+                     name%in% Growth_factors | analyte %in% Growth_factors  ~ "Growth factors",
+                     name %in% Immune_costimulation_checkpoint | analyte %in% Immune_costimulation_checkpoint ~ "Immune costimulation checkpoint",
+                    name %in% other | analyte %in% other ~ "other"
+)) 
+node_df %>% filter(is.na(group)) %>% pull(analyte)
 ```
 
 ### figure 5 network plot
 
 from created network, showing subst of the big nwtoqrk concentrating on the significant correlations of our 4 proteins 
+
+```{r}
+#"#163343FF",#"#56C0A7FF"
+
+colors <- c(
+"i-score"= "#DC1F51", #  "#D41146", #"#990F4B",
+
+"Chemokines"="#EC8FA3FF",
+"TNF superfamily"="#FCBA65FF",
+"other"= "#FAECCFFF",
+"Interleukins and receptors"="#8D7F99FF",
+"Growth factors"="#8C9D57FF",
+"Immune costimulation checkpoint"="#6FA3B8"
+)
+```
+
+
 ```{r}
 subset_edge_df <- edge_df %>% filter( to %in% c("CD40","PD-L1","CX3CL1","CD137") | from %in% c("CD40","PD-L1","CX3CL1","CD137") ) %>% mutate(og_weight=weight,weight=abs(weight))
 
 #subset_edge_df <- edge_df %>% filter( to %in% union(subset_edge_df$from,subset_edge_df$to) & from %in% union(subset_edge_df$from,subset_edge_df$to) ) %>% mutate(og_weight=weight,weight=abs(weight)) 
-subset_node_df <- node_df %>% filter(name %in% union(subset_edge_df$from, subset_edge_df$to))
+subset_node_df <- node_df %>% filter(name %in% union(subset_edge_df$from, subset_edge_df$to)) %>% mutate(group=if_else(name %in% c("CD40","PD-L1","CX3CL1","CD137"), "i-score",group))
 
 subset_g <- graph_from_data_frame(d = subset_edge_df, vertices = subset_node_df, directed = FALSE)
 
 graph<- ggraph(subset_g) + 
   ggraph::geom_edge_link(aes(width = abs(weight), color = og_weight)) +  
   ggraph::geom_node_point(aes(color = group), size = 9) +
-  ggraph::geom_node_text(aes(label = name), repel = F, size = 2) +
-  scale_edge_color_gradient2(low =  "#00D4FF",mid="#0567B8", high = "#08298E", midpoint = 0.175,name="partial correlation") +
-  scale_edge_width(range = c(0.2, 2),name="partial correlation") + theme_graph() + scale_color_manual(values=c("#DEDEDE","#AE7CCF")) 
+  #ggraph::geom_node_text(aes(label = name), repel = F, size = 2) +
+  # non-purple labels
+  geom_node_text(
+    aes(label = name,
+        filter = group != "Interleukins and receptors"),
+    color = "black",
+    repel = FALSE,
+    size = 2.2
+  ) +
 
+  # purple-group labels
+  geom_node_text(
+    aes(label = name,
+        filter = group == "Interleukins and receptors"),
+    color = "white",
+    repel = FALSE,
+    size = 2.2
+  ) +
+ # scale_edge_color_gradient2(low =  "white",mid="#F07470", high = "#DC1C13", midpoint = 0.175,name="partial correlation") +
+ scale_edge_color_gradient2(low =  "#F8F8FF",mid="#9B9A9C", high = "#3E3B39", midpoint = 0.175,name="partial correlation") +
+
+  scale_edge_width(range = c(0.2, 2),name="partial correlation") + theme_graph() + scale_color_manual(values=colors,name=NULL) 
+
+graph
 ```
 
 
 whole network 
+
+
+
 ```{r}
 g <- graph_from_data_frame(d = edge_df, vertices = node_df, directed = FALSE)
 
 graph<- ggraph(g) + 
   ggraph::geom_edge_link(aes(width = abs(weight), color = og_weight)) +  
   ggraph::geom_node_point(aes(color = group), size = 9) +
-  ggraph::geom_node_text(aes(label = name), repel = F, size = 1.8) +
-  scale_edge_color_gradient2(low =  "red",mid="white", high = "blue", midpoint = 0,name="partial correlation") +
-  scale_edge_width(range = c(0.2, 2),name="abs(partial correlation)") + theme_graph() + scale_color_manual(values=c("#DEDEDE","#AE7CCF")) 
+ # ggraph::geom_node_text(aes(label = name), repel = F, size = 1.8) +
+  # non-purple labels
+  geom_node_text(
+    aes(label = name,
+        filter = group != "Interleukins and receptors"),
+    color = "black",
+    repel = FALSE,
+    size = 2.2
+  ) +
+
+  # purple-group labels
+  geom_node_text(
+    aes(label = name,
+        filter = group == "Interleukins and receptors"),
+    color = "white",
+    repel = FALSE,
+    size = 2.2
+  ) +
+  scale_edge_color_gradient2(low =  "blue",mid="white", high = "red", midpoint = 0,name="partial correlation") +
+ # scale_edge_color_gradient2(low =  "#F8F8FF",mid="#6D6A6A", high = "#3E3B39", midpoint = 0.175,name="partial correlation") +
+  scale_color_manual(values=colors, name=NULL) +
+  scale_edge_width(range = c(0.2, 2),name="abs(partial correlation)") + theme_graph() 
 
 graph
 ```
